@@ -266,15 +266,44 @@ class Execution:
             threads = list(self._threads)
         deadline = time.monotonic() + max(10.0, grace_s)
         for thread in threads:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            thread.join(timeout=remaining)
+            if thread.ident is None:
+                # The scheduler appends a worker before starting it. Give it
+                # a moment so cancel() can join it and its terminal cleanup.
+                start_deadline = min(
+                    deadline, time.monotonic() + 1.0
+                )
+                while (
+                    thread.ident is None
+                    and time.monotonic() < start_deadline
+                ):
+                    time.sleep(0.001)
+            if thread.ident is not None:
+                thread.join(
+                    timeout=max(0.0, deadline - time.monotonic())
+                )
         alive = [thread.name for thread in threads if thread.is_alive()]
         if alive:
             log.warning(
                 "cancel left worker threads running: %s", ", ".join(alive)
             )
+
+        # A worker may have observed the cancel event only after the address
+        # snapshot above. Sweep any terminal assigned since then.
+        with self._cond:
+            remaining_addresses = {
+                result.terminal
+                for result in self._results.values()
+                if result.terminal
+            } - set(addresses)
+        for address in remaining_addresses:
+            try:
+                self._backend.kill(address)
+            except Exception:  # noqa: BLE001
+                log.debug("kill failed for %s", address, exc_info=True)
+            try:
+                self._backend.rm(address)
+            except Exception:  # noqa: BLE001
+                log.debug("rm failed for %s", address, exc_info=True)
 
         self._finalize()
 
@@ -563,6 +592,10 @@ class Execution:
     def _finalize(self) -> None:
         with self._cond:
             if self._finished:
+                # cancel() may update results after the scheduler finalized
+                # the run. Re-persist so run.json never keeps stale pending
+                # kernels.
+                self._persist_locked()
                 return
             self._finished = True
             if self._cancel_event.is_set():
@@ -616,6 +649,8 @@ class Execution:
                 kernels=kernels,
                 branches=self._branches,
                 agent=agent_name,
+                stream_order=list(self._streams),
+                kernel_order=list(self.graph.kernels),
             )
             self._store.write_run(document)
         except Exception as exc:  # noqa: BLE001 - persistence is best effort

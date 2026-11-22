@@ -422,6 +422,7 @@ class ExecutionEdgeTests(RepoCase):
     def test_cancel_logs_alive_workers(self) -> None:
         class AliveThread:
             name = "alive"
+            ident = 1
 
             def join(self, timeout=None):
                 return None
@@ -429,13 +430,32 @@ class ExecutionEdgeTests(RepoCase):
             def is_alive(self):
                 return True
 
+        class LateThread:
+            name = "late"
+            ident = None
+
+            def join(self, timeout=None):
+                return None
+
+            def is_alive(self):
+                return False
+
         backend = FakeBackend(hang={"api/slow"})
         graph = self.graph(_backend=backend)
         graph.stream("api", base="main").kernel("slow", self.prompt)
         execution = graph.start()
         execution._threads.append(AliveThread())  # type: ignore[arg-type]
+        execution._threads.append(LateThread())  # type: ignore[arg-type]
+        clock = {"now": 0.0}
+
+        def monotonic() -> float:
+            return clock["now"]
+
+        def sleep(seconds: float) -> None:
+            clock["now"] += seconds
+
         fake_time = SimpleNamespace(
-            monotonic=mock.Mock(side_effect=[0, 1000])
+            monotonic=monotonic, sleep=sleep
         )
         with mock.patch(
             "herda.execution.time", fake_time
@@ -446,6 +466,7 @@ class ExecutionEdgeTests(RepoCase):
     def test_scheduler_logs_alive_workers(self) -> None:
         class AliveThread:
             name = "alive"
+            ident = 1
 
             def join(self, timeout=None):
                 return None
@@ -461,7 +482,7 @@ class ExecutionEdgeTests(RepoCase):
         execution._scheduler.join()
         execution._threads.append(AliveThread())  # type: ignore[arg-type]
         fake_time = SimpleNamespace(
-            monotonic=mock.Mock(side_effect=[0, 1000])
+            monotonic=mock.Mock(side_effect=[0] + [1000] * 10)
         )
         with mock.patch(
             "herda.execution.time", fake_time

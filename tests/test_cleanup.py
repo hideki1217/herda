@@ -30,6 +30,9 @@ RUN_SHAPES = "20260101T000008Z-abcdef"
 RUN_ORPHAN = "20260101T000010Z-abcdef"
 RUN_EXISTING = "20260101T000011Z-123456"
 RUN_ORPHAN2 = "20260101T000012Z-abcdef"
+RUN_PURGE = "20260101T000013Z-abcdef"
+RUN_PURGE_DIRTY = "20260101T000014Z-abcdef"
+RUN_FLAGS = "20260101T000015Z-abcdef"
 
 
 class FakeCleanupBackend:
@@ -161,6 +164,124 @@ class CleanupTests(RepoCase):
         with self.assertRaises(CleanupError) as caught:
             cleanup_run(self.repo, RUN_SHAPES)
         self.assertEqual(caught.exception.code, "invalid_run_json")
+
+    def test_cleanup_flags_are_cumulative_and_subdir_root(self) -> None:
+        run_dir = Path(self.repo) / ".herda" / "runs" / RUN_FLAGS
+        run_dir.mkdir(parents=True)
+        document = {
+            "run_id": RUN_FLAGS,
+            "graph_slug": "g",
+            "kernels": {},
+            "streams": {},
+            "terminals_cleaned": True,
+            "worktrees_removed": True,
+            "branches_removed": False,
+        }
+        (run_dir / "run.json").write_text(
+            json.dumps(document), encoding="utf-8"
+        )
+        nested = Path(self.repo) / "nested"
+        nested.mkdir()
+        cleanup_run(
+            nested,
+            RUN_FLAGS,
+            branches=True,
+            backend=FakeCleanupBackend(),
+        )
+        updated = json.loads((run_dir / "run.json").read_text())
+        self.assertTrue(updated["terminals_cleaned"])
+        self.assertTrue(updated["worktrees_removed"])
+        self.assertTrue(updated["branches_removed"])
+
+    def test_purge_requires_no_worktrees_and_removes_run_dir(self) -> None:
+        run_dir = Path(self.repo) / ".herda" / "runs" / RUN_PURGE
+        run_dir.mkdir(parents=True)
+        (run_dir / "run.json").write_text(
+            json.dumps(
+                {
+                    "run_id": RUN_PURGE,
+                    "graph_slug": "g",
+                    "kernels": {},
+                    "streams": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        cleanup_run(
+            self.repo,
+            RUN_PURGE,
+            purge=True,
+            backend=FakeCleanupBackend(),
+        )
+        self.assertFalse(run_dir.exists())
+
+        run_dir = Path(self.repo) / ".herda" / "runs" / RUN_PURGE_DIRTY
+        run_dir.mkdir(parents=True)
+        worktree = (
+            Path(self.repo)
+            / ".herda"
+            / "worktrees"
+            / "g"
+            / RUN_PURGE_DIRTY
+            / "s"
+        )
+        worktree.mkdir(parents=True)
+        (run_dir / "run.json").write_text(
+            json.dumps(
+                {
+                    "run_id": RUN_PURGE_DIRTY,
+                    "graph_slug": "g",
+                    "kernels": {},
+                    "streams": {"s": {"worktree": str(worktree)}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaises(CleanupError) as caught:
+            cleanup_run(
+                self.repo,
+                RUN_PURGE_DIRTY,
+                purge=True,
+                backend=FakeCleanupBackend(),
+            )
+        self.assertEqual(caught.exception.code, "worktrees_remaining")
+        self.assertTrue((run_dir / "run.json").exists())
+
+    def test_purge_write_and_rmtree_failures_are_warnings(self) -> None:
+        run_dir = Path(self.repo) / ".herda" / "runs" / RUN_PURGE_DIRTY
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "run.json").write_text(
+            json.dumps(
+                {
+                    "run_id": RUN_PURGE_DIRTY,
+                    "graph_slug": "g",
+                    "kernels": {},
+                    "streams": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        with mock.patch(
+            "herda.cleanup.atomic_write_json", side_effect=OSError("no")
+        ), self.assertLogs("herda", level="WARNING"):
+            cleanup_run(
+                self.repo,
+                RUN_PURGE_DIRTY,
+                purge=True,
+                backend=FakeCleanupBackend(),
+            )
+        self.assertTrue(run_dir.exists())
+
+        with mock.patch(
+            "herda.cleanup.shutil.rmtree", side_effect=OSError("no")
+        ), self.assertLogs("herda", level="WARNING"):
+            cleanup_run(
+                self.repo,
+                RUN_PURGE_DIRTY,
+                purge=True,
+                backend=FakeCleanupBackend(),
+            )
+        self.assertTrue(run_dir.exists())
 
     def test_update_warning_and_worktree_hooks(self) -> None:
         run_dir = Path(self.repo) / ".herda" / "runs" / RUN_UPDATE

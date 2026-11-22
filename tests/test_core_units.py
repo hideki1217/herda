@@ -282,6 +282,24 @@ class StoreTests(unittest.TestCase):
             branches={},
         )
         self.assertEqual(run["run_id"], "r")
+        self.assertNotIn("stream_order", run)
+        self.assertNotIn("kernel_order", run)
+        ordered = run_document(
+            run_id="r",
+            graph_name="g",
+            graph_slug="g",
+            repo=Path("/repo"),
+            state="running",
+            started_at=None,
+            finished_at=None,
+            streams={},
+            kernels={},
+            branches={},
+            stream_order=["api"],
+            kernel_order=["api/k"],
+        )
+        self.assertEqual(ordered["stream_order"], ["api"])
+        self.assertEqual(ordered["kernel_order"], ["api/k"])
 
 
 class WorktreeTests(RepoCase):
@@ -339,6 +357,99 @@ class WorktreeTests(RepoCase):
             worktree.resolve_commit(self.repo, "")
         with self.assertRaises(WorktreeError):
             worktree.resolve_commit(self.repo, "nope")
+
+    def test_parse_and_require_git_version(self) -> None:
+        self.assertEqual(worktree.parse_version("git version 2.53.0"), (2, 53, 0))
+        self.assertEqual(worktree.parse_version("pi 1.6"), (1, 6))
+        self.assertIsNone(worktree.parse_version(None))
+        self.assertIsNone(worktree.parse_version("no digits"))
+        with mock.patch(
+            "herda.worktree.git_version", return_value="git version 2.20.0"
+        ):
+            with self.assertRaises(WorktreeError) as caught:
+                worktree.require_git_version()
+        self.assertEqual(caught.exception.code, "git_too_old")
+        with mock.patch(
+            "herda.worktree.git_version", return_value="unknown"
+        ), self.assertLogs("herda", level="WARNING"):
+            self.assertEqual(worktree.require_git_version(), "unknown")
+        with mock.patch(
+            "herda.worktree.git_version", return_value="git version 2.30.0"
+        ):
+            self.assertEqual(
+                worktree.require_git_version(), "git version 2.30.0"
+            )
+
+    def test_repo_root_subdir_and_worktree(self) -> None:
+        subdir = Path(self.repo) / "nested" / "dir"
+        subdir.mkdir(parents=True)
+        self.assertEqual(worktree.repo_root(subdir), Path(self.repo).resolve())
+
+        linked = Path(self.root) / "linked"
+        worktree.create_worktree(self.repo, linked, "linked-branch", "main")
+        self.assertEqual(worktree.repo_root(linked), Path(self.repo).resolve())
+        self.assertEqual(
+            worktree.require_run_repo(subdir), Path(self.repo).resolve()
+        )
+
+        with self.assertRaises(WorktreeError):
+            worktree.repo_root(Path(self.root) / "missing")
+        with self.assertRaises(WorktreeError):
+            worktree.repo_root(self.root)
+
+        with mock.patch(
+            "herda.worktree.run_git",
+            side_effect=[
+                self._proc(0, out=str(self.repo)),
+                self._proc(0, out="common.git"),
+            ],
+        ):
+            self.assertEqual(
+                worktree.repo_root(self.repo), Path(self.repo).resolve()
+            )
+        with mock.patch(
+            "herda.worktree.run_git",
+            side_effect=[
+                self._proc(0, out=str(self.repo)),
+                self._proc(1),
+            ],
+        ):
+            self.assertEqual(
+                worktree.repo_root(self.repo), Path(self.repo).resolve()
+            )
+
+    def test_run_repo_root_prefers_nearest_run_owner(self) -> None:
+        nested = Path(self.repo) / "nested"
+        (nested / ".herda" / "runs").mkdir(parents=True)
+        self.assertEqual(
+            worktree.run_repo_root(nested), nested.resolve()
+        )
+        self.assertEqual(
+            worktree.require_run_repo(nested), nested.resolve()
+        )
+
+        linked = Path(self.root) / "linked2"
+        worktree.create_worktree(self.repo, linked, "linked-branch2", "main")
+        (Path(self.repo) / ".herda" / "runs").mkdir(parents=True)
+        self.assertEqual(
+            worktree.run_repo_root(linked), Path(self.repo).resolve()
+        )
+
+        with self.assertRaises(WorktreeError):
+            worktree.run_repo_root(Path(self.root) / "missing")
+
+        outside = Path(self.root) / "outside"
+        (outside / ".herda" / "runs").mkdir(parents=True)
+        with self.assertRaises(WorktreeError):
+            worktree.run_repo_root(outside)
+
+    def test_require_git_repo_rejects_old_git(self) -> None:
+        with mock.patch(
+            "herda.worktree.git_version", return_value="git version 2.20.0"
+        ):
+            with self.assertRaises(WorktreeError) as caught:
+                worktree.require_git_repo(self.repo)
+        self.assertEqual(caught.exception.code, "git_too_old")
 
     def test_branch_exists_other_error(self) -> None:
         with mock.patch(

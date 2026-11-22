@@ -102,20 +102,29 @@ does not depend on Pi's global session history.
 
 ## Operations
 
+herda does not commit worktree changes. A prompt that must leave its work on a
+branch should tell the agent to run `git add` / `git commit`; otherwise the
+worktree is dirty and `herda clean --worktrees` refuses to discard it.
+
 ```bash
 herda validate graph.py --models     # check model ids with pi --list-models
-herda status [RUN_ID] [--json]       # inspect run.json
-herda clean RUN_ID --worktrees       # remove worktrees for a finished run
+herda run graph.py --json            # print the final run.json
+herda status [RUN_ID] [--json]       # stream branches/worktrees, dirty state, run.json
+herda clean RUN_ID --worktrees       # remove clean worktrees for a finished run
 herda clean RUN_ID --worktrees --branches  # also remove herda/* branches
+herda clean RUN_ID --worktrees --purge     # also remove the run directory
 herda clean --orphans                # recover worktrees without run.json
 herda clean --orphans --branches     # also remove orphan herda/* branches
 ```
+
+`herda status` and `herda clean` resolve the repository that owns the run even
+when invoked from a subdirectory or a linked worktree.
 
 ## Examples
 
 - [`examples/hello_world`](./examples/hello_world/): five prompts split across
   two streams build a small Python hello-world project, using a cross-stream
-  event, `wait_stream` and `inherit_session=True`.
+  event, `wait_stream` and `inherit_session=True`. Each prompt commits its work.
 
 ```bash
 cd examples/hello_world

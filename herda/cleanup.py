@@ -21,7 +21,7 @@ from .worktree import (
     prune_worktrees,
     remove_engine_dir,
     remove_worktree,
-    require_git_repo,
+    require_run_repo,
     run_git,
     worktree_is_dirty,
 )
@@ -59,12 +59,14 @@ def cleanup_run(
     worktrees: bool = False,
     branches: bool = False,
     force: bool = False,
+    purge: bool = False,
     backend: Any | None = None,
 ) -> None:
     run_id = validate_run_id(run_id)
-    root = require_git_repo(repo)
+    root = require_run_repo(repo)
     herda_dir = root / ".herda"
     run_json = herda_dir / "runs" / run_id / "run.json"
+    run_dir = run_json.parent
     if not run_json.exists():
         raise CleanupError(
             "run_not_found",
@@ -138,18 +140,47 @@ def cleanup_run(
                 run_id=run_id,
             )
 
+        if purge:
+            remaining = [
+                str(info.get("worktree"))
+                for info in streams.values()
+                if isinstance(info, dict)
+                and info.get("worktree")
+                and Path(str(info["worktree"])).exists()
+            ]
+            if remaining:
+                raise CleanupError(
+                    "worktrees_remaining",
+                    "cannot purge run metadata while worktrees remain: "
+                    + ", ".join(remaining),
+                    "run with worktrees=True (and force=True if dirty) first",
+                )
+
         if terminals_ok:
             for item in kernels.values():
                 if isinstance(item, dict):
                     item["terminal"] = None
-        document["terminals_cleaned"] = terminals_ok
+        document["terminals_cleaned"] = bool(
+            document.get("terminals_cleaned")
+        ) or terminals_ok
         document["cleaned_at"] = _now_iso()
-        document["worktrees_removed"] = bool(worktrees)
-        document["branches_removed"] = bool(branches)
+        document["worktrees_removed"] = bool(
+            document.get("worktrees_removed")
+        ) or bool(worktrees)
+        document["branches_removed"] = bool(
+            document.get("branches_removed")
+        ) or bool(branches)
+        written = True
         try:
             atomic_write_json(run_json, document)
         except Exception as exc:  # noqa: BLE001 - best effort
+            written = False
             log.warning("could not update %s: %s", run_json, exc)
+        if purge and written:
+            try:
+                shutil.rmtree(run_dir)
+            except OSError as exc:
+                log.warning("could not purge %s: %s", run_dir, exc)
     finally:
         lock.release()
 
@@ -318,7 +349,7 @@ def cleanup_orphans(
     branch's ``run6`` suffix.
     """
 
-    root = require_git_repo(repo)
+    root = require_run_repo(repo)
     herda_dir = root / ".herda"
     runs_dir = herda_dir / "runs"
     owned_root = (herda_dir / "worktrees").resolve()

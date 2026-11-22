@@ -14,6 +14,10 @@ import subprocess
 from pathlib import Path
 from typing import Mapping, Sequence
 
+from .worktree import parse_version
+
+MIN_PI_VERSION = (1, 6)
+
 
 class PiAgent:
     """Run the Pi coding agent in a herdr terminal."""
@@ -47,6 +51,9 @@ class PiAgent:
             return None
         lines = (proc.stdout or proc.stderr).strip().splitlines()
         return lines[0] if lines else None
+
+    def version_tuple(self) -> tuple[int, ...] | None:
+        return parse_version(self.version())
 
     def list_models(self) -> set[str] | None:
         """Return ``provider/model`` strings advertised by Pi."""

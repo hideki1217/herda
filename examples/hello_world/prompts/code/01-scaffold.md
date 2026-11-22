@@ -18,5 +18,14 @@ Create the first version of a hello-world program:
    Hello, world!
    ```
 
-Keep the implementation small and standard-library only. Reply with a one-line
-summary when the command succeeds.
+Keep the implementation small and standard-library only.
+
+When the command succeeds, commit only the file you created on the current
+branch:
+
+```bash
+git add hello.py
+git commit -m "add hello-world scaffold"
+```
+
+Reply with a one-line summary and the commit hash.

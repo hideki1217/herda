@@ -11,5 +11,13 @@ Create `docs/plan.md` with a short outline for the project README:
 - Development check: `python3 -m unittest -v`
 - Keep it under 25 lines.
 
-Do not create `README.md` yet; a later prompt will do that. Reply with a short
-summary.
+Do not create `README.md` yet; a later prompt will do that.
+
+Commit the outline on the current branch:
+
+```bash
+git add docs/plan.md
+git commit -m "add README outline"
+```
+
+Reply with a short summary and the commit hash.

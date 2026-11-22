@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from unittest import mock
 
 from herda import (
@@ -299,6 +300,11 @@ class ExecutionTests(RepoCase):
             self.assertIsNotNone(result.output_path)
             self.assertTrue(result.output_path.exists())
             self.assertIn(name, document["kernels"])
+        self.assertEqual(document["stream_order"], ["api", "web"])
+        self.assertEqual(
+            document["kernel_order"],
+            ["api/design", "api/implement", "api/test", "web/ui"],
+        )
 
         worktrees = [stream.worktree for stream in graph.streams.values()]
         branches = [stream.branch for stream in graph.streams.values()]
@@ -346,7 +352,7 @@ class ExecutionTests(RepoCase):
         execution = graph.start()
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
-            if execution.kernels["api/slow"].terminal:
+            if execution.kernels["api/slow"].state == KernelState.running:
                 break
             time.sleep(0.02)
         execution.cancel(grace_s=0.2)
@@ -359,6 +365,71 @@ class ExecutionTests(RepoCase):
             execution.kernels["api/next"].state, KernelState.skipped
         )
         self.assertEqual(backend.terminals, {})
+
+    def test_cancel_sweeps_late_terminals_and_logs_errors(self) -> None:
+        backend = FakeBackend(hang={"api/slow"})
+        graph = self.graph(_backend=backend)
+        api = graph.stream("api", base="main")
+        api.kernel("slow", self.prompt)
+        api.kernel("next", self.prompt)
+        execution = graph.start()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if execution.kernels["api/slow"].state == KernelState.running:
+                break
+            time.sleep(0.02)
+
+        next_result = execution._results["api/next"]
+        execution._results["api/next"] = replace(
+            next_result, terminal="late-terminal"
+        )
+        original_rm = backend.rm
+
+        def rm(terminal: str) -> None:
+            if terminal == "late-terminal":
+                raise RuntimeError("rm failed")
+            original_rm(terminal)
+
+        backend.rm = rm  # type: ignore[method-assign]
+        with self.assertLogs("herda", level="DEBUG"):
+            execution.cancel(grace_s=0)
+        self.assertEqual(execution.state, RunState.canceled)
+        self.assertEqual(backend.terminals, {})
+
+    def test_cancel_after_early_finalize_persists_skipped(self) -> None:
+        backend = FakeBackend(hang={"api/slow"})
+        graph = self.graph(_backend=backend)
+        api = graph.stream("api", base="main")
+        api.kernel("slow", self.prompt)
+        api.kernel("next", self.prompt)
+        execution = graph.start()
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if execution.kernels["api/slow"].state == KernelState.running:
+                break
+            time.sleep(0.02)
+
+        original_interrupt = backend.interrupt
+
+        def interrupt_and_finalize(terminal, *, timeout_s=10.0):
+            execution._cancel_event.set()
+            execution._finalize()
+            return original_interrupt(terminal, timeout_s=timeout_s)
+
+        backend.interrupt = interrupt_and_finalize  # type: ignore[method-assign]
+        execution.cancel(grace_s=0)
+
+        self.assertEqual(execution.state, RunState.canceled)
+        document = execution._store.read_run()
+        assert document is not None
+        self.assertEqual(document["state"], "canceled")
+        self.assertEqual(
+            document["kernels"]["api/next"]["state"], "skipped"
+        )
+        self.assertEqual(
+            execution.kernels["api/next"].state, KernelState.skipped
+        )
 
     def test_blocked_then_resolved_succeeds(self) -> None:
         backend = FakeBackend(block_once={"api/blocked"})

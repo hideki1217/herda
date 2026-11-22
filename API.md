@@ -1,6 +1,6 @@
 # herda API Specification
 
-- Status: **Draft v0.1**
+- Status: **Draft v0.2**
 - Package: `herda`
 - Runtime: Python 3.11+
 - Built on: [`herdr-core`](https://herdr.dev/core/) (`hc`) protocol generation 1
@@ -8,7 +8,7 @@
 - Verified with: `hc` 0.1.21, Pi 1.6.0
 - Date: 2026-11-22
 
-**目次**: [1. 目的](#1-目的) / [2. 用語](#2-用語) / [3. 設計原則](#3-設計原則) / [4. クイックスタート](#4-クイックスタート) / [5. 公開 API](#5-公開-api) / [6. DAG](#6-dag) / [7. 実行セマンティクス](#7-実行セマンティクス) / [8. herdr 連携](#8-herdr-連携) / [9. CLI](#9-cli) / [10. エラー](#10-エラー) / [11. セキュリティ](#11-セキュリティ) / [12. テスト](#12-テスト) / [13. v0.1 の範囲](#13-v01-の範囲)
+**目次**: [1. 目的](#1-目的) / [2. 用語](#2-用語) / [3. 設計原則](#3-設計原則) / [4. クイックスタート](#4-クイックスタート) / [5. 公開 API](#5-公開-api) / [6. DAG](#6-dag) / [7. 実行セマンティクス](#7-実行セマンティクス) / [8. herdr 連携](#8-herdr-連携) / [9. CLI](#9-cli) / [10. エラー](#10-エラー) / [11. セキュリティ](#11-セキュリティ) / [12. テスト](#12-テスト) / [13. v0.2 の範囲](#13-v02-の範囲)
 
 ---
 
@@ -110,9 +110,10 @@ Python (herda)
 3. **Stream 間の同期は event。** Kernel に `depends_on` は付けない。Stream が event を record し、別の Stream が wait する。
 4. **既定では会話を引き継がない。** 引き継ぎは `inherit_session=True` のときだけ。直前 Kernel の会話のみ。
 5. **worktree は herda が所有する。** ただし未コミット変更を破壊しない。削除は明示操作のみ。
-6. **完了は OSC 7501 だけを信じる。** 画面文字列で成功判定しない。
-7. **herdr app がライブ一覧。** herda は `herdr.space` / `herdr.tab` と表示名を整える。
-8. **v0.1 は小さく。** 再開、retry、result 判定などは入れない（§13）。
+6. **commit は prompt / agent の責務。** herda は worktree の変更を自動 commit しない。branch に成果を残す必要がある prompt は、agent に `git add` / `git commit` を明示する。
+7. **完了は OSC 7501 だけを信じる。** 画面文字列で成功判定しない。
+8. **herdr app がライブ一覧。** herda は `herdr.space` / `herdr.tab` と表示名を整える。
+9. **v0.2 は小さく。** 再開、retry、result 判定などは入れない（§13）。
 
 名前は 1–64 Unicode 文字。制御文字と `/` は禁止（`/` は `stream/kernel` の区切り）。同じ階層で一意。
 
@@ -134,7 +135,7 @@ pip install herda
 herda doctor
 ```
 
-`herda doctor` は `git`、`hc`、`pi` のバージョン、OSC 7501 の観測（`--deep`）、`herdr-app` の有無（`--app`）を確認する。
+`herda doctor` は `git`、`hc`、`pi` のバージョン、OSC 7501 の観測（`--deep`）、`herdr-app` の有無（`--app`）を確認する。`git` は 2.30 未満、`pi` は 1.6 未満なら失敗する。バージョン文字列を取得できない場合は存在チェックだけを行い、警告に留める。`Graph.validate()` / `start()` の preflight も同じ最小バージョンを検査する。
 
 ### 4.2 最小の DAG
 
@@ -271,6 +272,7 @@ class Graph:
         worktrees: bool = False,
         branches: bool = False,
         force: bool = False,
+        purge: bool = False,
     ) -> None: ...
 
     @property
@@ -304,8 +306,8 @@ class Graph:
 - `start()` は validate、worktree 作成、prompt スナップショットを行ってから実行を開始し、`Execution` を返す。
 - `run()` は `start()` + `wait()`。
 - Kernel の失敗は例外ではなく `KernelResult` に記録し、`RunState.failed` を返す。preflight 失敗だけが例外。
-- `draw()` は raw Mermaid を UTF-8 で書き、パスを返す。拡張子は `.mmd` / `.md`。
-- `cleanup()` は run の後始末。terminal を labels で探して kill / rm し、`worktrees=True` のときだけ worktree を削除する。dirty なら `force=True` が無い限り `CleanupError`。`branches=True` のときだけ `herda/<graph_slug>/...` の branch を削除する。active な run（lock 保持中）には使えない。
+- `draw()` は raw Mermaid を UTF-8 で書き、パスを返す。拡張子は `.mmd` / `.md`。出力先に書けない場合は `HerdaError(code="draw_failed")`。
+- `cleanup()` は run の後始末。terminal を labels で探して kill / rm し、`worktrees=True` のときだけ worktree を削除する。dirty なら `force=True` が無い限り `CleanupError`。`branches=True` のときだけ `herda/<graph_slug>/...` の branch を削除する。`purge=True` は cleanup 後に `runs/<run_id>/` を削除する（worktree が残っている場合は `CleanupError`）。active な run（lock 保持中）には使えない。
 
 ### 5.4 `Stream`
 
@@ -340,7 +342,7 @@ class Stream:
 ```
 
 - `base` は branch / tag / commit。`start()` 時に commit に固定する。
-- branch / worktree は自動決定（§7.1）。v0.1 では明示指定しない。
+- branch / worktree は自動決定（§7.1）。v0.2 では明示指定しない。
 - 空の Stream は `ValidationError`。
 - Stream 内の Kernel は宣言順に直列。Kernel に依存指定は無い。
 - `record_event(name=None)` はその時点の Stream の末尾を event として記録し、`Event` を返す。`name` を省略すると `event-<n>` が自動で付く。まだ Kernel が無い Stream でも record できる（待っても何も待たない）。
@@ -420,10 +422,10 @@ class Execution:
 - `query()` は run 全体が終端かどうかを返す。
 - `wait_stream(stream)` は指定 Stream の全 Kernel が終端になるまで待つ。CUDA の stream synchronize に相当し、run 全体は止めない。
 - `query_stream(stream)` は指定 Stream の全 Kernel が終端かどうかを返す。
-- `cancel()` は新規スケジュールを止め、実行中 Session を `interrupt` → grace 後に `kill` → `hc rm` し、`RunState.canceled` にする。実行中は `KernelState.canceled`、未実行は `skipped`（`error.code="canceled"`）。worktree は残し、lock は解放する。
+- `cancel()` は新規スケジュールを止め、実行中 Session を `interrupt` → grace 後に `kill` → `hc rm` し、`RunState.canceled` にする。実行中は `KernelState.canceled`、未実行は `skipped`（`error.code="canceled"`）。worktree は残し、lock は解放する。cancel と同時に scheduler が run を finalize しても、cancel 後の最終結果は必ず `run.json` に再保存される。
 - `kernels` のキーは `"stream/kernel"`。
 
-**注意**: `start()` はプロセス内のバックグラウンド実行。Python プロセスが終了すると DAG も止まる。herdr terminal は生き残るが、v0.1 に resume は無い（§13）。
+**注意**: `start()` はプロセス内のバックグラウンド実行。Python プロセスが終了すると DAG も止まる。herdr terminal は生き残るが、v0.2 に resume は無い（§13）。
 
 ### 5.8 結果型
 
@@ -527,6 +529,7 @@ flowchart LR
 - preflight 途中で失敗したら、その preflight で作った clean な worktree と、それに伴い新規作成した branch を rollback する。既存の worktree / branch は触らない。
 - worktree 内の `.herda/` は `.herda/.gitignore` の `*` で無視する。メイン repo 側は `.git/info/exclude` に `.herda/` を追加する。
 - branch は削除しない。統合・削除はユーザーが git で行う。
+- herda は commit しない。branch に変更を残す prompt は、agent に `git add` / `git commit` を指示する。未コミットの worktree は dirty として扱われ、`cleanup(worktrees=True)` は `force=True` なしで拒否する。
 
 ### 7.2 Session のライフサイクル
 
@@ -638,7 +641,7 @@ herdr-core の OSC 7501 だけを使う。
 - `agent-sessions/<stream>/` は Pi の `--session-dir`。`inherit_session=True` は同じ Stream のこの dir で `--continue` する。
 - `locks/<graph_slug>.lock` は `flock`。同じ Graph の同時 run は `ConcurrentRunError`。app の space/tab と run 状態を一意に保つため。
 - `run.json` は atomic write（temp + rename）する。
-- **v0.1 は `run.json` から resume しない。** 記録は status 確認と cleanup のためだけに使う。
+- **v0.2 は `run.json` から resume しない。** 記録は status 確認と cleanup のためだけに使う。
 
 ---
 
@@ -689,6 +692,8 @@ hc run --bg --json --no-parent --no-notify \
 | 状態待ち | `hc wait <terminal> --timeout <s> --json` |
 | prompt 投入 | `hc send --wait --json --timeout <s> <terminal> <text>` |
 | 画面 | `hc read <terminal> --lines <n> --json` |
+
+- `hc ls --json` の `status` は、`hc get` と同様のオブジェクトの場合と文字列の場合がある。`HcBackend.list()` はどちらも `TerminalInfo.status` に反映する。
 | label 更新 | `hc label <terminal> k=v …` |
 | 中断 | `hc interrupt <terminal> --timeout <s>` |
 | 終了 | `hc kill <terminal>` |
@@ -727,7 +732,7 @@ herdr-app do tab.rename   '{"id":"<tab_id>","name":"<stream name>"}'
 - `herdr-app` が無い／起動していない／rename が失敗した場合は、既定名のまま続行する。表示自体は labels で成立する。
 - program 終了で app は pane を閉じる。tab は残る（空 tab を app が閉じる場合は次の Session で再作成）。
 - `herda.*` labels は `hc ls` / `hc events` のフィルタ用。app の画面には出ない。
-- 生の `herda.*` labels を app に並べたい場合は app mod が必要。v0.1 のスコープ外。
+- 生の `herda.*` labels を app に並べたい場合は app mod が必要。v0.2 のスコープ外。
 
 #### 8.2.1 名前の適用
 
@@ -737,7 +742,7 @@ herdr-app do tab.rename   '{"id":"<tab_id>","name":"<stream name>"}'
 | tab 名 | `Stream.name` | `herdr.tab` の ID で app に tab を作らせ、`tab.rename` で Stream 名にする |
 | terminal 名 | `Kernel.name` / `Stream.name` | `hc run --name` で `herda-<stream>-<kernel>-<hash>` を付ける |
 
-v0.1 では space/tab の独立した表示名フィールドは持たない。Graph 名 / Stream 名をそのまま使う。独立名が必要になったら `Graph(space_name=...)` / `Stream(tab_name=...)` を追加する。Graph / Stream 名を変えると ID も変わるため、別 space / tab になる。
+v0.2 では space/tab の独立した表示名フィールドは持たない。Graph 名 / Stream 名をそのまま使う。独立名が必要になったら `Graph(space_name=...)` / `Stream(tab_name=...)` を追加する。Graph / Stream 名を変えると ID も変わるため、別 space / tab になる。
 
 - `herdr.space` / `herdr.tab` は **ID** であり、表示名ではない。表示名は必ず rename で入れる。
 - 同じ terminal に希望名を label として持たせる:
@@ -763,7 +768,7 @@ herdr-core を SSH 先の devcontainer で動かし、herdr app をホストで�
                                  pi
 ```
 
-- **herda は core と同じ devcontainer 内で動かす。** herda から見れば local core なので、v0.1 の「worktree は local」制約を満たす。
+- **herda は core と同じ devcontainer 内で動かす。** herda から見れば local core なので、v0.2 の「worktree は local」制約を満たす。
 - **ホスト側の local core** に devcontainer を machine として追加する（container 内の `hc` ではない）。`hc machine add <ssh-host>` または app の Add machine。CLI で行う場合も、app が使う local core に対して実行する。
 - app の Add machine は SSH config の Host を列挙する。鍵認証で `ssh <host>` が非対話に通る状態にする。
 - devcontainer 内の `hc` は app が install できる。architecture が違う場合は released build を使う。
@@ -784,7 +789,7 @@ hc machine add --name devbox --install \
 制約:
 
 - **コンテナが止まると session も止まる。** devcontainer の lifecycle（VS Code を閉じたときの停止など）に依存する。herdr-core の linger は container 内では期待できない。
-- **herda は host から devcontainer の worktree を操作しない。** host で herda を動かす構成は v0.1 の対象外。
+- **herda は host から devcontainer の worktree を操作しない。** host で herda を動かす構成は v0.2 の対象外。
 - **app の自動 rename は remote では herda 単体では効かない。** herda は container 内から host の `herdr-app` CLI を呼べないため、space/tab は Herdr の既定名になる。`herdr.space` / `herdr.tab` の ID は run をまたいで安定なので、**tab が残っている限り** app 上で一度 rename すれば以後も保持される。
 - 完全自動にする場合は、**ホスト側で `herda app-sync`** を動かす予定。これは local core の `hc events` / `hc ls` を読み、`herda.space_name` / `herda.tab_name` labels を持つ remote terminal を見つけ、machine-qualified な space/tab ID に対して `herdr-app do space.rename` / `tab.rename` を実行する。app が起動していて `herdr-app` CLI が使えることが条件。
 - この helper は Python API ではなく、ホスト側の運用コマンド（`herda app-sync`）として提供する。container 内では動かさない。host にも `herda` を install するか、app-sync 相当を独立した小さな helper として配布する。
@@ -843,10 +848,10 @@ Python ライブラリが主。CLI は最小限。
 ```bash
 herda doctor [--deep] [--app] [--json]
 herda validate graph.py [--models]      # --models: pi --list-models と照合
-herda run graph.py [--timeout SECONDS]  # 完了までブロック
-herda status [RUN_ID] [--json]          # run.json を表示
+herda run graph.py [--timeout SECONDS] [--json]  # 完了までブロック
+herda status [RUN_ID] [--json]          # run.json と stream の状態を表示
 herda draw graph.py -o dag.mmd
-herda clean RUN_ID [--worktrees] [--branches] [--force]
+herda clean RUN_ID [--worktrees] [--branches] [--force] [--purge]
 herda clean --orphans [--branches] [--force]  # run.json のない worktree / branch を回収
 
 # ホスト側のみ。remote の space/tab 名を herda.* labels に合わせる（予定）
@@ -854,13 +859,14 @@ herda app-sync
 ```
 
 - `graph.py` はモジュールレベルに `graph` という `Graph` を持つ。
-- CLI は `graph.py` のあるディレクトリへ `chdir` してから import する。`base_dir` 未指定時の prompt 相対パスはそこを起点にする。
-- `herda run` は失敗時に exit 1。`SIGINT` / `SIGTERM` は `Execution.cancel()` にマップし、last state を表示して終了する。`--timeout` は待ち時間超過時に run を cancel する。
-- `herda draw` は `-o -` で stdout。
+- CLI は `graph.py` のあるディレクトリへ `chdir` してから import する。`base_dir` 未指定時の prompt 相対パスはそこを起点にする。graph ファイルと同じディレクトリは import 中だけ `sys.path` の先頭に追加するため、兄弟モジュールを import できる。
+- `herda run` は失敗時に exit 1。`SIGINT` / `SIGTERM` は `Execution.cancel()` にマップし、last state を表示して終了する。`--timeout` は待ち時間超過時に run を cancel し、最終結果を表示したうえで `HerdaTimeoutError(code="run_timeout")` にする。`--json` は完了後に `run.json` をそのまま stdout に出す。
+- `herda status` / `herda clean` / `herda clean --orphans` の `--repo` は、カレントディレクトリがサブディレクトリでも、linked worktree でも、run を所有する root を解決する。探索順は「近い祖先から `.herda/runs` または `.herda/worktrees` を持つ git worktree」で、見つからなければ `git rev-parse` の main repository root にフォールバックする。これにより `Graph(repo=<subdir>)` の run と、main repo の run の両方を扱える。
+- `herda status` は run.json を読み取り専用で表示する。RUN_ID 省略時は最新 run。人間向け表示では `run_dir`、cleanup 状態、stream ごとの `branch` / `worktree` / `base_commit` / dirty 状態、kernel を宣言順で表示する。`--json` は run.json の内容だけを出す。
+- `herda draw` は `-o -` で stdout。出力先に書き込めない場合は clean なエラーにする。
 - `herda app-sync` はホスト側専用。local core の `hc events` / `hc ls` を監視し、`herda.space_name` / `herda.tab_name` に合わせて remote の space/tab を rename する（予定）。container 内では実行しない。
 - ライブの一覧・attach・ログは herdr app / `hc` を使う（`hc attach`、`hc read`）。
-- `herda clean` はカレントリポジトリの `.herda/runs/<run_id>/run.json` を読む。branch は `--branches` 指定時だけ削除する。
-- `herda status` は run.json を読み取り専用で表示する。RUN_ID 省略時は最新 run。
+- `herda clean` は run を所有するリポジトリの `.herda/runs/<run_id>/run.json` を読む。branch は `--branches` 指定時だけ削除する。`--purge` は cleanup 後に run ディレクトリを削除する。worktree が残っている場合は worktree と run ディレクトリを削除せず `CleanupError`（terminal cleanup は best-effort で先に走る）。
 
 ---
 
@@ -889,11 +895,11 @@ API の誤用・セットアップ失敗・cleanup の拒否だけが例外に�
 |---|---|---|
 | `ValidationError` | 必須名、重複、空 Stream / Graph、DAG 循環、モデル未解決、`inherit_session` の指定ミス、不正な timeout | なし |
 | `PromptError` | `.md` でない、存在しない、空、読めない、UTF-8 でない | なし |
-| `WorktreeError` | worktree 作成、branch 衝突、git 失敗、base 解決失敗 | 作成済みの clean な worktree / branch は rollback |
+| `WorktreeError` | worktree 作成、branch 衝突、git 失敗、base 解決失敗、git が古い | 作成済みの clean な worktree / branch は rollback |
 | `HerdrError` | `hc` 不在、core 不達、起動時の CLI エラー | なし（preflight 段階） |
-| `HerdaTimeoutError` | `Execution.wait(timeout_s)` / `wait_stream(timeout_s)` の待ち時間超過 | run は継続 |
+| `HerdaTimeoutError` | `Execution.wait(timeout_s)` / `wait_stream(timeout_s)` の待ち時間超過。CLI の `--timeout` は cancel 後に `run_timeout` | run は継続（CLI timeout は cancel） |
 | `ConcurrentRunError` | 同じ Graph の run が既に実行中 | なし |
-| `CleanupError` | 不正な run_id、run.json の不一致、active run、dirty worktree、所有権外の path | 対象 resource は削除しない |
+| `CleanupError` | 不正な run_id、run.json の不一致、active run、dirty worktree、所有権外の path、purge 時の worktree 残存 | 対象 resource は削除しない |
 
 `Graph.validate()` は副作用なし。`Graph.start()` は validate / preflight / lock / worktree 作成 / prompt snapshot のどこで失敗しても、**新規に作った worktree と branch を rollback** する。rollback 自体の失敗はログに残し、元の例外を優先する。
 
@@ -973,12 +979,13 @@ pending ──> ready ──> running ──> succeeded
 6. 非終端の Kernel を `canceled` または `skipped` に確定する。
 7. worker を有界時間で join し、`RunState.canceled` に確定する。
 8. 期限内に終わらない worker はログに残す。遅れて返った outcome は cancel 済みの結果を上書きしない。
+9. scheduler が先に `_finalize()` していても、6 の結果更新後に `run.json` を必ず再保存する。`state="canceled"` と未実行 kernel の `skipped` が同じファイルに現れる。
 
 `grace_s < 0` は 0 として扱う。cancel は run の lock を解放するが、orphan worker が残った場合はその事実をログに残す。
 
 ### 10.7 Cleanup
 
-`Graph.cleanup(run_id, *, worktrees=False, branches=False, force=False)` / `herda clean` のセマンティクス:
+`Graph.cleanup(run_id, *, worktrees=False, branches=False, force=False, purge=False)` / `herda clean` のセマンティクス:
 
 - `run_id` は `YYYYMMDDTHHMMSSZ-<hex6>` のみ許可する。`/`, `..`, 絶対パスは `CleanupError`。
 - `<repo>/.herda/runs/<run_id>/run.json` が存在し、`document["run_id"] == run_id` でなければ `CleanupError`。
@@ -988,8 +995,10 @@ pending ──> ready ──> running ──> succeeded
 - worktree は `<repo>/.herda/worktrees/<graph_slug>/<run_id>/` の配下だけを削除する。path は `resolve()` 後に containment を確認する。
 - dirty worktree は `force=True` がない限り削除しない。**dirty 判定は `.herda/` の削除より前**に行う。
 - branch は既定では削除しない。`branches=True` のときだけ `herda/<graph_slug>/` prefix を確認して削除する。
+- `worktrees_removed` / `branches_removed` / `terminals_cleaned` は累積値。後から `--branches` だけ実行しても、過去に worktree を削除した事実を `false` に戻さない。
+- `purge=True` は cleanup 後に `runs/<run_id>/` を削除する。いずれかの stream worktree がまだ存在する場合は `CleanupError(code="worktrees_remaining")` とし、run ディレクトリを消さない。
 - cleanup の途中で 1 terminal の kill / rm が失敗しても、他の terminal と worktree の cleanup は続行し、失敗をログに残す。
-- cleanup 後に残る `run.json` / `screen.txt` / `meta.json` は監査用に保持する。
+- cleanup 後に残る `run.json` / `screen.txt` / `meta.json` は監査用に保持する。不要なら `purge=True` で削除する。
 
 ### 10.7.1 Orphan recovery
 
@@ -1008,13 +1017,13 @@ pending ──> ready ──> running ──> succeeded
 - `run.json` は atomic write（temp + rename）する。書き込み失敗は run を失敗させない。
 - `meta.json` / `screen.txt` の保存失敗も Kernel の成否を変えない。失敗はログに残す。
 - Kernel の状態遷移は `run.json` に反映する。高頻度の同じ状態は dedupe する。
-- `run.json` には少なくとも `run_id`, `graph`, `agent`, `state`, `streams`, `kernels`, `started_at`, `finished_at` を含める。
+- `run.json` には少なくとも `run_id`, `graph`, `agent`, `state`, `streams`, `kernels`, `branches`, `stream_order`, `kernel_order`, `started_at`, `finished_at` を含める。`stream_order` / `kernel_order` は宣言順を保持し、`herda status` の人間向け表示に使う。
 - `KernelResult` の `terminal`, `status`, `error`, `output_path` は最終的に確定した値を保持する。
-- engine が異常終了した場合、`run.json` の `state=running` が残ることがある。v0.1 は resume しない。`herda clean` と herdr の `hc` で手動回復する。
+- engine が異常終了した場合、`run.json` の `state=running` が残ることがある。v0.2 は resume しない。`herda clean` と herdr の `hc` で手動回復する。
 
 ### 10.9 再試行と回復
 
-- v0.1 は Kernel / run の自動 retry をしない。
+- v0.2 は Kernel / run の自動 retry をしない。
 - 失敗した Kernel の下流は `skipped` になる。無関係な Stream は継続する。
 - 新しい run は新しい worktree / branch / session dir を作る。
 - `run.json` からの resume、Kernel 単体 retry、agent の session id 指定は将来候補（§13）。
@@ -1053,10 +1062,17 @@ pending ──> ready ──> running ──> succeeded
 15. `blocked_timeout` / `status_timeout` / `session_timeout` が発火する。
 16. `NaN` / `inf` の timeout が `ValidationError` になる。
 17. agent adapter が `--session-dir` / `agent_args` / `env` / `PI_PROGRAM_STATUS=1` を組み立てる。
-18. `herda status` が run.json を読み取り専用で表示する。
-19. `cleanup_orphans` が run.json のない worktree / branch を回収し、active lock / dirty worktree を skip する。
+18. `herda status` が run.json を読み取り専用で表示し、宣言順、run_dir、cleanup 状態、stream の dirty 状態を出す。サブディレクトリ / linked worktree からも run を解決する。
+19. `cleanup_orphans` が run.json のない worktree / branch を回収し、active lock / dirty worktree を skip する。サブディレクトリからも動く。
 20. `validate_models()` が `pi --list-models` の exact / pattern / fuzzy を照合する。
-21. ruff / mypy が CI で通る。
+21. `cancel()` と scheduler の finalize が競合しても、cancel 後の `run.json` が `pending` を残さない。
+22. `clean --purge` が worktree 残存時に拒否し、cleanup 後は run ディレクトリを削除する。
+23. graph ファイルの兄弟モジュールを import できる。
+24. `hc ls` の文字列 status とオブジェクト status の両方を `HcBackend.list()` が読む。
+25. `herda draw` の書き込み失敗が clean な `HerdaError` になる。
+26. `herda run --timeout` が cancel 後の最終結果を表示する。
+27. `git` / `pi` の最小バージョン検査が old / unknown を正しく扱う。
+28. ruff / mypy が CI で通る。
 
 ### 12.2 統合（実 herdr-core + pi）
 
@@ -1073,25 +1089,26 @@ pending ──> ready ──> running ──> succeeded
 
 ---
 
-## 13. v0.1 の範囲
+## 13. v0.2 の範囲
 
 ### 13.1 意図的に入れないもの
 
 | 機能 | 理由 |
 |---|---|
 | agent の session id / `--session` | 今は特定の過去 Session に戻りたくない。`--continue` で足りる。 |
-| result file による成功判定 | OSC 7501 の `idle` はターン終了であって成功ではないが、v0.1 では DAG の成否は「turn 完了」で十分。必要になったら追加する。 |
+| result file による成功判定 | OSC 7501 の `idle` はターン終了であって成功ではないが、v0.2 では DAG の成否は「turn 完了」で十分。必要になったら追加する。 |
 | headless / `pi -p` | herdr app で見る TUI が要件。 |
 | Kernel の retry | 失敗は記録して止める。再実行は新しい run。 |
-| engine crash 後の resume | 実装が大きい。terminal は herdr が保持するので、v0.1 では手動で attach / clean する。 |
+| engine crash 後の resume | 実装が大きい。terminal は herdr が保持するので、v0.2 では手動で attach / clean する。 |
 | events API | ライブ表示は herdr app。Python 側は `wait()` と `kernels` で足りる。 |
 | prompt templating | 動的な値は `HERDA_BRANCHES` などの環境変数で渡す。 |
 | DOT / SVG 描画 | Mermaid で足りる。 |
 | 明示 branch / worktree / slug | 自動命名で足りる。 |
-| カスタム agent | v0.1 は Pi adapter のみ。agent_args / env は Graph / Kernel で指定できる。 |
+| カスタム agent | v0.2 は Pi adapter のみ。agent_args / env は Graph / Kernel で指定できる。 |
 | herdr app の space/tab 手動指定 | 自動 ID + rename で足りる。 |
 | worktree の自動削除 | 成果を守る。明示 `cleanup` のみ。 |
 | branch の自動削除 | 既定では削除しない。`clean --branches` で明示的に削除する。 |
+| 変更の自動 commit | commit は prompt / agent の責務。herda は worktree の変更を commit しない。 |
 
 ### 13.2 既知の制限
 
@@ -1108,10 +1125,12 @@ pending ──> ready ──> running ──> succeeded
 - result file による成功判定
 - 明示 branch / worktree
 - 非同期 API
-- host 側 herda から herdr machine を操作する対応（container 内で動かす §8.3 は v0.1 の範囲）
+- host 側 herda から herdr machine を操作する対応（container 内で動かす §8.3 は v0.2 の範囲）
 - DOT / SVG
 - app mod による `herda.*` labels の表示
 - `hc connect` の persistent client 化（現在は `hc wait` + `hc get`）
+- `herda run` の進捗表示（現状は run.json / `herda status` / herdr app を見る）
+- `herda clean --dry-run`（削除対象の確認）
 
 ### 13.4 未決
 
@@ -1123,7 +1142,7 @@ pending ──> ready ──> running ──> succeeded
 
 ## 14. まとめ
 
-herda v0.1 の中心は 3 つだけ。
+herda v0.2 の中心は 3 つだけ。
 
 1. **Stream = worktree**。run ごとに branch と worktree を自動で作る。
 2. **Kernel = 1 prompt の herdr セッション**。OSC 7501 で完了を検知し、終わったら kill して次へ進む。

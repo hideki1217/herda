@@ -83,6 +83,25 @@ class DoctorHelperTests(unittest.TestCase):
         ):
             self.assertEqual(doctor._which_version("x"), (True, ""))
 
+    def test_version_ok(self) -> None:
+        self.assertEqual(
+            doctor._version_ok(False, "missing", (2, 30)),
+            (False, "missing"),
+        )
+        ok, detail = doctor._version_ok(
+            True, "git version 2.20.0", (2, 30)
+        )
+        self.assertFalse(ok)
+        self.assertIn("need 2.30+", detail)
+        self.assertEqual(
+            doctor._version_ok(True, "git version 2.30.0", (2, 30)),
+            (True, "git version 2.30.0"),
+        )
+        self.assertEqual(
+            doctor._version_ok(True, "unknown", (1, 6)),
+            (True, "unknown"),
+        )
+
     def test_hc_status(self) -> None:
         with mock.patch("herda.doctor.shutil.which", return_value=None):
             self.assertFalse(doctor._hc_status()[0])

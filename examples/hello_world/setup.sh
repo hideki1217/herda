@@ -15,7 +15,11 @@ if [ ! -d "$workspace/.git" ]; then
 This repository is created by examples/hello_world/setup.sh.
 The prompts in this example build the hello-world project here.
 EOF
-  git -C "$workspace" add README.md
+  cat > "$workspace/.gitignore" <<'EOF'
+__pycache__/
+*.pyc
+EOF
+  git -C "$workspace" add README.md .gitignore
   git -C "$workspace" commit -m "initial commit"
 fi
 

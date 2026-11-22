@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
-from .agent import PiAgent
+from .agent import MIN_PI_VERSION, PiAgent
 from .errors import HerdrError
 
 log = logging.getLogger("herda")
@@ -196,6 +196,13 @@ class HcBackend:
         self.pi_path = self.agent.resolve()
         if self.pi_path is None:
             missing.append(self.agent.missing_hint)
+        else:
+            parsed = self.agent.version_tuple()
+            if parsed is not None and parsed < MIN_PI_VERSION:
+                missing.append(
+                    f"pi {self.agent.version()} is too old; herda needs "
+                    "Pi 1.6 or newer"
+                )
 
         if missing:
             for item in missing:
@@ -335,13 +342,17 @@ class HcBackend:
             if not isinstance(item, dict):
                 continue
             status = item.get("status")
+            if isinstance(status, dict):
+                status_word = status.get("state")
+            elif status is not None:
+                status_word = str(status)
+            else:
+                status_word = None
             result.append(
                 TerminalInfo(
                     address=str(item.get("address", "")),
                     state=str(item.get("state", "live")),
-                    status=status.get("state")
-                    if isinstance(status, dict)
-                    else None,
+                    status=status_word,
                     turn=int(item.get("turn") or 0),
                     reported=bool(item.get("reported")),
                     labels={

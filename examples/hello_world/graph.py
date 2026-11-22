@@ -48,5 +48,10 @@ design = docs.kernel("design", "prompts/docs/01-design.md")
 
 # readme waits for every code kernel declared so far (scaffold/greet/test)
 # and for docs/design, which is already ordered inside the docs stream.
+# It inherits the design conversation so the root README decision is clear.
 docs.wait_stream(code)
-docs.kernel("readme", "prompts/docs/02-readme.md")
+docs.kernel(
+    "readme",
+    "prompts/docs/02-readme.md",
+    inherit_session=True,
+)

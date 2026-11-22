@@ -1,6 +1,8 @@
-Continue in the `docs` worktree. `docs/plan.md` should already exist.
+Continue in the `docs` worktree. The current directory is the repository root.
+`docs/plan.md` should already exist.
 
-Write `README.md` for the tiny hello-world project:
+Write `README.md` at the repository root (not `docs/README.md`) for the tiny
+hello-world project:
 
 - Follow the outline in `docs/plan.md`.
 - Include a short description.
@@ -12,4 +14,11 @@ Write `README.md` for the tiny hello-world project:
 - Do not invent extra features, configuration, packaging, or dependencies.
 - Keep it concise.
 
-Reply with a one-line summary.
+Commit the README on the current branch:
+
+```bash
+git add README.md
+git commit -m "add README"
+```
+
+Reply with a one-line summary and the commit hash.

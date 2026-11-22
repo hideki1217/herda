@@ -11,9 +11,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .agent import PiAgent
+from .agent import MIN_PI_VERSION, PiAgent
 from .backend import HcBackend
-from .worktree import git_version
+from .worktree import MIN_GIT_VERSION, git_version, parse_version
 
 log = logging.getLogger("herda")
 
@@ -45,6 +45,20 @@ def _which_version(command: str, *args: str) -> tuple[bool, str]:
     if proc.returncode != 0:
         return False, f"exit {proc.returncode}: {first}"
     return True, first
+
+
+def _version_ok(
+    ok: bool,
+    detail: str,
+    minimum: tuple[int, ...],
+) -> tuple[bool, str]:
+    if not ok:
+        return ok, detail
+    parsed = parse_version(detail)
+    if parsed is not None and parsed < minimum:
+        required = ".".join(str(part) for part in minimum)
+        return False, f"{detail} (need {required}+)"
+    return ok, detail
 
 
 def _hc_command() -> str:
@@ -156,9 +170,10 @@ def run_doctor(*, deep: bool = False, app_check: bool = False) -> list[Check]:
     checks: list[Check] = []
 
     git_ok, git_detail = _which_version("git", "--version")
-    checks.append(
-        Check("git", git_ok, git_detail or git_version() or "missing")
+    git_ok, git_detail = _version_ok(
+        git_ok, git_detail or git_version() or "missing", MIN_GIT_VERSION
     )
+    checks.append(Check("git", git_ok, git_detail))
 
     hc_ok, hc_detail = _which_version(_hc_command(), "--version")
     checks.append(Check("hc", hc_ok, hc_detail))
@@ -168,6 +183,9 @@ def run_doctor(*, deep: bool = False, app_check: bool = False) -> list[Check]:
 
     pi = _pi_command()
     pi_ok, pi_detail = _which_version(pi, "--version")
+    pi_ok, pi_detail = _version_ok(
+        pi_ok, pi_detail, MIN_PI_VERSION
+    )
     checks.append(Check("pi", pi_ok, pi_detail))
 
     if deep:

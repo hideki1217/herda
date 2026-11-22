@@ -15,7 +15,10 @@ docs stream:        └─> design(docs/plan.md) -> readme <┘
 - `code` は `scaffold_done` を record します。
 - `docs` は `wait_event(scaffold_done)` の後に `design` を実行します。
 - `docs/readme` は `wait_stream(code)` で code stream 全体（scaffold/greet/test）
-  の完了を待ってから実行します。
+  の完了を待ってから実行します。`inherit_session=True` で `design` の会話も
+  引き継ぎます。
+- 各 prompt は最後に `git add` / `git commit` を行います。herda 自身は
+  commit しません。branch に成果を残すのは prompt / agent の責務です。
 - herda は stream 間でファイルを自動マージしません。成果は branch ごとに残ります。
 
 ## 実行
@@ -54,14 +57,15 @@ python3 hello.py Ada
 python3 -m unittest -v
 ```
 
-`docs` stream の worktree では README を確認できます。
+`docs` stream の worktree では、リポジトリ root の README を確認できます。
 
 ```bash
 cd ../docs
 cat README.md
 ```
 
-main に統合する場合:
+各 kernel が commit 済みなので、main に merge できます。code は fast-forward、
+docs は code を先に merge すると merge commit になります（どちらも clean に統合できます）。
 
 ```bash
 cd workspace
@@ -80,7 +84,12 @@ cd workspace
 herda clean <run_id> --worktrees
 ```
 
+各 worktree は prompt が commit 済みなので、`--force` なしで削除できます。
+commit に失敗した kernel がある場合は dirty として拒否されるので、worktree で
+commit するか、成果を捨ててよい場合だけ `--force` を付けてください。
+
 branch は削除されません。不要なら通常どおり `git branch -D` で消してください。
+run ディレクトリまで消す場合は `herda clean <run_id> --worktrees --purge` を使います。
 
 ## Mermaid
 

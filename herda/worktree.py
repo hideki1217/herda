@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -11,6 +12,9 @@ from pathlib import Path
 from .errors import WorktreeError
 
 log = logging.getLogger("herda")
+
+MIN_GIT_VERSION = (2, 30)
+_VERSION_RE = re.compile(r"(\d+)\.(\d+)(?:\.(\d+))?")
 
 
 def require_git() -> str:
@@ -78,6 +82,38 @@ def git_version() -> str | None:
     return (proc.stdout or proc.stderr).strip() or None
 
 
+def parse_version(text: str | None) -> tuple[int, ...] | None:
+    """Extract the first ``major.minor[.patch]`` version from text."""
+
+    if not text:
+        return None
+    match = _VERSION_RE.search(text)
+    if match is None:
+        return None
+    return tuple(
+        int(part) for part in match.groups() if part is not None
+    )
+
+
+def require_git_version() -> str | None:
+    """Warn on unknown versions and reject a version below the minimum."""
+
+    version = git_version()
+    parsed = parse_version(version)
+    if parsed is not None and parsed < MIN_GIT_VERSION:
+        raise WorktreeError(
+            "git_too_old",
+            f"git {version} is too old; herda needs git 2.30 or newer",
+            "upgrade git and retry",
+        )
+    if parsed is None:
+        log.warning(
+            "could not determine the git version; continuing without a "
+            "minimum-version check"
+        )
+    return version
+
+
 def is_git_repo(repo: str | Path) -> bool:
     path = Path(repo)
     if not path.exists():
@@ -94,7 +130,78 @@ def require_git_repo(repo: str | Path) -> Path:
             f"{path} is not a git working tree",
             "pass Graph(repo=...) pointing at the root of a git repository",
         )
+    require_git_version()
     return path
+
+
+def repo_root(repo: str | Path) -> Path:
+    """Return the root of the repository that owns ``repo``'s git state.
+
+    For a subdirectory this is the worktree top level. For a linked worktree
+    this is the main repository root that owns the shared ``.git`` directory,
+    which is where herda keeps ``.herda/runs``.
+    """
+
+    path = Path(repo).expanduser().resolve()
+    if not path.exists():
+        raise WorktreeError(
+            "not_a_git_repo",
+            f"{path} does not exist",
+            "pass an existing path inside the git repository",
+        )
+    proc = run_git(path, "rev-parse", "--show-toplevel", check=False)
+    if proc.returncode != 0:
+        raise WorktreeError(
+            "not_a_git_repo",
+            f"{path} is not a git working tree",
+            "pass Graph(repo=...) pointing at the root of a git repository",
+        )
+    top = Path(proc.stdout.strip()).resolve()
+    common = run_git(top, "rev-parse", "--git-common-dir", check=False)
+    if common.returncode == 0 and common.stdout.strip():
+        common_path = Path(common.stdout.strip())
+        if not common_path.is_absolute():
+            common_path = (top / common_path).resolve()
+        if common_path.name == ".git":
+            return common_path.parent
+    return top
+
+
+def run_repo_root(repo: str | Path) -> Path:
+    """Return the nearest directory that owns herda run/worktree metadata.
+
+    This handles a ``Graph(repo=<subdir>)`` run as well as the usual main
+    repository: the nearest ancestor with ``.herda/runs`` or
+    ``.herda/worktrees`` wins. A linked worktree's own ``.herda`` contains
+    neither, so status from inside a stream worktree falls back to the main
+    repository.
+    """
+
+    path = Path(repo).expanduser().resolve()
+    if not path.exists():
+        raise WorktreeError(
+            "not_a_git_repo",
+            f"{path} does not exist",
+            "pass an existing path inside the git repository",
+        )
+    for ancestor in (path, *path.parents):
+        engine = ancestor / ".herda"
+        if not (
+            (engine / "runs").exists()
+            or (engine / "worktrees").exists()
+        ):
+            continue
+        if is_git_repo(ancestor):
+            return ancestor
+    return repo_root(path)
+
+
+def require_run_repo(repo: str | Path) -> Path:
+    """Resolve the repository that owns run metadata and check git version."""
+
+    root = run_repo_root(repo)
+    require_git_version()
+    return root
 
 
 def resolve_commit(repo: str | Path, ref: str) -> str:

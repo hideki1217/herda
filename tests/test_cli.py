@@ -7,6 +7,7 @@ import io
 import json
 import os
 import runpy
+import sys
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,13 +26,15 @@ from herda.cli import (
     _load_graph,
     _print_error,
     _print_results,
+    _print_run_output,
     _sync_once,
+    _worktree_state,
     main,
 )
 from herda.doctor import Check
 from herda.types import ErrorInfo, KernelResult
 
-from .test_herda import RepoCase
+from .test_herda import RepoCase, _git
 
 
 class FakeExecution:
@@ -166,6 +169,30 @@ class CliTests(RepoCase):
         graph = _load_graph(self.graph_path)
         self.assertEqual(graph.name, "cli")
 
+        with open(os.path.join(self.root, "helper.py"), "w") as fh:
+            fh.write("MODEL = 'helper/model'\n")
+        import_graph = os.path.join(self.root, "graph_import.py")
+        with open(import_graph, "w") as fh:
+            fh.write(
+                "from herda import Graph\n"
+                "from helper import MODEL\n"
+                "graph = Graph('imported', 'repo', default_model=MODEL)\n"
+                "graph.stream('api').kernel('a', 'prompts/prompt.md')\n"
+            )
+        graph = _load_graph(import_graph)
+        self.assertEqual(graph.default_model, "helper/model")
+
+        class NoRemovePath(list):
+            def remove(self, item):
+                raise ValueError("gone")
+
+        with mock.patch.object(sys, "path", NoRemovePath(sys.path)):
+            _load_graph(self.graph_path)
+        with mock.patch.object(
+            sys, "path", [str(self.root)] + list(sys.path)
+        ):
+            _load_graph(self.graph_path)
+
     def test_print_error(self) -> None:
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
@@ -217,6 +244,36 @@ class CliTests(RepoCase):
                 0,
             )
         self.assertTrue(os.path.exists(target))
+
+        missing = os.path.join(self.root, "missing-dir", "dag.mmd")
+        with self.assertRaises(HerdaError) as caught:
+            _cmd_draw(
+                SimpleNamespace(
+                    graph=self.graph_path,
+                    output=missing,
+                    direction="LR",
+                )
+            )
+        self.assertEqual(caught.exception.code, "draw_failed")
+
+    def test_print_run_output_fallbacks(self) -> None:
+        execution = FakeExecution()
+        execution.run_dir = Path(self.root) / "missing-run"
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            _print_run_output(execution, True)
+        self.assertIn("run_id: run", out.getvalue())
+
+        execution.run_dir.mkdir()
+        (execution.run_dir / "run.json").write_text("[]", encoding="utf-8")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            _print_run_output(execution, True)
+        self.assertIn("run_id: run", out.getvalue())
+
+    def test_worktree_state_missing(self) -> None:
+        self.assertEqual(_worktree_state(None), "missing")
+        self.assertEqual(_worktree_state(""), "missing")
 
     def test_print_results(self) -> None:
         out = io.StringIO()
@@ -285,17 +342,49 @@ class CliTests(RepoCase):
 
     def test_cmd_run_timeout_cancels(self) -> None:
         execution = TimeoutExecution()
+        execution.run_dir = Path(self.root) / "run"
+        execution.run_dir.mkdir()
+        (execution.run_dir / "run.json").write_text(
+            json.dumps({"state": "canceled"}), encoding="utf-8"
+        )
         graph = FakeGraph(execution)
+        out = io.StringIO()
         with mock.patch(
             "herda.cli._load_graph", return_value=graph
         ), mock.patch(
             "herda.cli.signal.getsignal", return_value=object()
         ), mock.patch(
             "herda.cli.signal.signal"
-        ), contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaises(HerdaTimeoutError):
-                _cmd_run(SimpleNamespace(graph="g", timeout=1))
+        ), contextlib.redirect_stdout(out), contextlib.redirect_stderr(
+            io.StringIO()
+        ):
+            with self.assertRaises(HerdaTimeoutError) as caught:
+                _cmd_run(SimpleNamespace(graph="g", timeout=1, json=True))
         self.assertTrue(execution.cancelled)
+        self.assertEqual(caught.exception.code, "run_timeout")
+        self.assertIn('"state": "canceled"', out.getvalue())
+
+    def test_cmd_run_json_output(self) -> None:
+        execution = FakeExecution()
+        execution.run_dir = Path(self.root) / "run"
+        execution.run_dir.mkdir()
+        (execution.run_dir / "run.json").write_text(
+            json.dumps({"run_id": "run", "state": "succeeded"}),
+            encoding="utf-8",
+        )
+        graph = FakeGraph(execution)
+        out = io.StringIO()
+        with mock.patch(
+            "herda.cli._load_graph", return_value=graph
+        ), mock.patch(
+            "herda.cli.signal.getsignal", return_value=object()
+        ), mock.patch(
+            "herda.cli.signal.signal"
+        ), contextlib.redirect_stdout(out):
+            self.assertEqual(
+                _cmd_run(SimpleNamespace(graph="g", json=True)), 0
+            )
+        self.assertIn('"run_id": "run"', out.getvalue())
 
     def test_cmd_status(self) -> None:
         run_id = "20260101T000000Z-abcdef"
@@ -367,6 +456,82 @@ class CliTests(RepoCase):
             )
         self.assertEqual(caught.exception.code, "invalid_run_id")
 
+    def test_cmd_status_streams_order_dirty_and_subdir(self) -> None:
+        run_id = "20260101T000010Z-abcdef"
+        run_dir = Path(self.repo) / ".herda" / "runs" / run_id
+        run_dir.mkdir(parents=True)
+        clean = Path(self.root) / "clean-wt"
+        _git(self.repo, "worktree", "add", "-b", "clean-branch", str(clean), "main")
+        dirty = Path(self.root) / "dirty-wt"
+        _git(self.repo, "worktree", "add", "-b", "dirty-branch", str(dirty), "main")
+        (dirty / "untracked.txt").write_text("x", encoding="utf-8")
+        missing = Path(self.root) / "missing-wt"
+        unknown = Path(self.root) / "unknown-wt"
+        unknown.mkdir()
+        document = {
+            "run_id": run_id,
+            "graph": "g",
+            "state": "succeeded",
+            "agent": "pi",
+            "cleaned_at": "2026-01-01T00:00:01Z",
+            "worktrees_removed": False,
+            "streams": {
+                "api": {
+                    "base": "main",
+                    "base_commit": "abc",
+                    "branch": "herda/g/api-abcdef",
+                    "worktree": str(clean),
+                },
+                "web": {
+                    "base": "main",
+                    "base_commit": "abc",
+                    "branch": "herda/g/web-abcdef",
+                    "worktree": str(dirty),
+                },
+                "gone": {
+                    "base": "main",
+                    "base_commit": "abc",
+                    "branch": "herda/g/gone-abcdef",
+                    "worktree": str(missing),
+                },
+                "unknown": {
+                    "base": "main",
+                    "base_commit": "abc",
+                    "branch": "herda/g/unknown-abcdef",
+                    "worktree": str(unknown),
+                },
+            },
+            "stream_order": ["web", 1, "missing-key", "api", "gone", "unknown"],
+            "kernels": {
+                "api/a": {"state": "succeeded"},
+                "web/z": {"state": "succeeded"},
+            },
+            "kernel_order": ["web/z", "api/a"],
+        }
+        (run_dir / "run.json").write_text(
+            json.dumps(document), encoding="utf-8"
+        )
+        nested = Path(self.repo) / "nested"
+        nested.mkdir()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(
+                _cmd_status(
+                    SimpleNamespace(repo=nested, run_id=run_id, json=False)
+                ),
+                0,
+            )
+        text = out.getvalue()
+        self.assertLess(text.index("  web:"), text.index("  api:"))
+        self.assertLess(text.index("  web/z:"), text.index("  api/a:"))
+        self.assertNotIn("missing-key", text)
+        self.assertIn("status: clean", text)
+        self.assertIn("status: dirty", text)
+        self.assertIn("status: missing", text)
+        self.assertIn("status: unknown", text)
+        self.assertIn("cleaned_at:", text)
+        self.assertIn("run_dir:", text)
+
     def test_cmd_status_empty_and_invalid_json(self) -> None:
         with self.assertRaises(HerdaError) as caught:
             _cmd_status(
@@ -404,6 +569,33 @@ class CliTests(RepoCase):
                 0,
             )
 
+        (run_dir / "run.json").write_text(
+            json.dumps({"streams": [], "kernels": {}}), encoding="utf-8"
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(
+                _cmd_status(
+                    SimpleNamespace(
+                        repo=self.repo, run_id=run_id, json=False
+                    )
+                ),
+                0,
+            )
+
+        (run_dir / "run.json").write_text(
+            json.dumps({"streams": {"s": "not-a-dict"}, "kernels": {}}),
+            encoding="utf-8",
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(
+                _cmd_status(
+                    SimpleNamespace(
+                        repo=self.repo, run_id=run_id, json=False
+                    )
+                ),
+                0,
+            )
+
     def test_cmd_clean(self) -> None:
         out = io.StringIO()
         with mock.patch("herda.cli.cleanup_run") as cleanup, contextlib.redirect_stdout(
@@ -416,11 +608,13 @@ class CliTests(RepoCase):
                     worktrees=True,
                     branches=True,
                     force=True,
+                    purge=True,
                 )
             )
         self.assertEqual(result, 0)
         cleanup.assert_called_once()
         self.assertTrue(cleanup.call_args.kwargs["branches"])
+        self.assertTrue(cleanup.call_args.kwargs["purge"])
         self.assertIn("cleaned run run", out.getvalue())
 
     def test_cmd_clean_orphans_and_missing_run_id(self) -> None:

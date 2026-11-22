@@ -201,8 +201,10 @@ def run_document(
     kernels: dict[str, Any],
     branches: dict[str, str],
     agent: str | None = None,
+    stream_order: list[str] | None = None,
+    kernel_order: list[str] | None = None,
 ) -> dict[str, Any]:
-    return {
+    document: dict[str, Any] = {
         "version": "0.1",
         "run_id": run_id,
         "graph": graph_name,
@@ -216,6 +218,11 @@ def run_document(
         "kernels": kernels,
         "branches": branches,
     }
+    if stream_order is not None:
+        document["stream_order"] = list(stream_order)
+    if kernel_order is not None:
+        document["kernel_order"] = list(kernel_order)
+    return document
 
 
 def kernel_document(result: Any, prompt_path: Path | None = None) -> dict[str, Any]:

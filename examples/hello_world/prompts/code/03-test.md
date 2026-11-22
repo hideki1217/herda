@@ -14,4 +14,11 @@ Add tests using only the Python standard library:
 5. Do not rewrite the feature; only change `hello.py` if a real bug prevents
    the tests from passing.
 
-Reply with the test command and the result.
+Commit only the files you changed on the current branch, for example:
+
+```bash
+git add test_hello.py
+git commit -m "add unittest coverage"
+```
+
+Reply with the test command, the result, and the commit hash.

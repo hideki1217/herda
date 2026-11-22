@@ -479,6 +479,7 @@ class Graph:
         worktrees: bool = False,
         branches: bool = False,
         force: bool = False,
+        purge: bool = False,
     ) -> None:
         cleanup_run(
             self.repo,
@@ -486,6 +487,7 @@ class Graph:
             worktrees=worktrees,
             branches=branches,
             force=force,
+            purge=purge,
             backend=self._backend,
         )
 

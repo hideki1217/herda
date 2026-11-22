@@ -18,11 +18,14 @@ from . import app
 from .backend import HcBackend
 from .cleanup import cleanup_orphans, cleanup_run, validate_run_id
 from .doctor import print_checks, run_doctor
-from .errors import HerdaError, HerdaTimeoutError
+from .errors import HerdaError, HerdaTimeoutError, WorktreeError
 from .graph import Graph
 from .store import read_json
 from .types import RunState
-from .worktree import require_git_repo
+from .worktree import (
+    require_run_repo,
+    worktree_is_dirty,
+)
 
 log = logging.getLogger("herda")
 
@@ -50,6 +53,9 @@ def _load_graph(path_text: str) -> Graph:
         )
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
+    added_path = str(path.parent) not in sys.path
+    if added_path:
+        sys.path.insert(0, str(path.parent))
     try:
         spec.loader.exec_module(module)
     except HerdaError:
@@ -59,6 +65,12 @@ def _load_graph(path_text: str) -> Graph:
             "import_failed",
             f"importing {path} failed: {type(exc).__name__}: {exc}",
         ) from exc
+    finally:
+        if added_path:
+            try:
+                sys.path.remove(str(path.parent))
+            except ValueError:
+                pass
     graph = getattr(module, "graph", None)
     if not isinstance(graph, Graph):
         raise HerdaError(
@@ -109,7 +121,14 @@ def _cmd_draw(args: argparse.Namespace) -> int:
     if output == "-":
         sys.stdout.write(graph.to_mermaid(direction=args.direction))
         return 0
-    target = graph.draw(output, direction=args.direction)
+    try:
+        target = graph.draw(output, direction=args.direction)
+    except OSError as exc:
+        raise HerdaError(
+            "draw_failed",
+            f"could not write Mermaid output to {output}: {exc}",
+            "check that the output directory exists and is writable",
+        ) from exc
     print(target)
     return 0
 
@@ -127,9 +146,23 @@ def _print_results(execution) -> None:
         print(line)
 
 
+def _print_run_output(execution, as_json: bool) -> None:
+    if as_json:
+        run_json = execution.run_dir / "run.json"
+        try:
+            document = read_json(run_json)
+        except (OSError, ValueError):
+            document = None
+        if isinstance(document, dict):
+            print(json.dumps(document, indent=2, sort_keys=True))
+            return
+    _print_results(execution)
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     graph = _load_graph(args.graph)
     execution = graph.start()
+    as_json = bool(getattr(args, "json", False))
 
     def _cancel(signum, frame) -> None:  # noqa: ANN001
         log.warning("received signal %s; canceling run %s", signum, execution.id)
@@ -145,13 +178,19 @@ def _cmd_run(args: argparse.Namespace) -> int:
     try:
         try:
             execution.wait(timeout_s=getattr(args, "timeout", None))
-        except HerdaTimeoutError:
+        except HerdaTimeoutError as exc:
             log.warning(
                 "run %s exceeded its CLI timeout; canceling it",
                 execution.id,
             )
             execution.cancel(grace_s=5.0)
-            raise
+            _print_run_output(execution, as_json)
+            raise HerdaTimeoutError(
+                "run_timeout",
+                f"run {execution.id} exceeded its CLI timeout and was "
+                "canceled",
+                "increase --timeout or rerun the graph",
+            ) from exc
     finally:
         for sig, handler in previous.items():
             try:
@@ -159,7 +198,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             except (ValueError, OSError):
                 pass
 
-    _print_results(execution)
+    _print_run_output(execution, as_json)
     return 0 if execution.state == RunState.succeeded else 1
 
 
@@ -186,13 +225,38 @@ def _cmd_clean(args: argparse.Namespace) -> int:
         worktrees=args.worktrees,
         branches=getattr(args, "branches", False),
         force=args.force,
+        purge=getattr(args, "purge", False),
     )
     print(f"cleaned run {args.run_id}")
     return 0
 
 
+def _ordered_keys(mapping: dict, order: object) -> list[str]:
+    keys: list[str] = []
+    if isinstance(order, list):
+        for key in order:
+            if isinstance(key, str) and key in mapping and key not in keys:
+                keys.append(key)
+    for key in mapping:
+        if key not in keys:
+            keys.append(key)
+    return keys
+
+
+def _worktree_state(raw: object) -> str:
+    if not raw:
+        return "missing"
+    path = Path(str(raw))
+    if not path.exists():
+        return "missing"
+    try:
+        return "dirty" if worktree_is_dirty(path) else "clean"
+    except WorktreeError:
+        return "unknown"
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
-    root = require_git_repo(args.repo)
+    root = require_run_repo(args.repo)
     runs_dir = root / ".herda" / "runs"
     run_id = getattr(args, "run_id", None)
     if run_id:
@@ -239,10 +303,42 @@ def _cmd_status(args: argparse.Namespace) -> int:
     print(f"agent: {document.get('agent')}")
     print(f"started_at: {document.get('started_at')}")
     print(f"finished_at: {document.get('finished_at')}")
+    print(f"run_dir: {run_json.parent}")
+    for key in (
+        "cleaned_at",
+        "terminals_cleaned",
+        "worktrees_removed",
+        "branches_removed",
+    ):
+        if key in document:
+            print(f"{key}: {document[key]}")
+
+    streams = document.get("streams", {})
+    if not isinstance(streams, dict):
+        streams = {}
+    if streams:
+        print("streams:")
+        for name in _ordered_keys(streams, document.get("stream_order")):
+            info = streams[name]
+            if not isinstance(info, dict):
+                continue
+            print(f"  {name}:")
+            for key in ("base", "base_commit", "branch", "worktree"):
+                if info.get(key) is not None:
+                    print(f"    {key}: {info[key]}")
+            if info.get("worktree"):
+                print(
+                    "    status: "
+                    + _worktree_state(info.get("worktree"))
+                )
+
     kernels = document.get("kernels", {})
     if not isinstance(kernels, dict):
         kernels = {}
-    for name, result in kernels.items():
+    if kernels:
+        print("kernels:")
+    for name in _ordered_keys(kernels, document.get("kernel_order")):
+        result = kernels[name]
         if not isinstance(result, dict):
             continue
         line = f"  {name}: {result.get('state')}"
@@ -361,6 +457,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="cancel the run after this many seconds",
     )
+    run.add_argument(
+        "--json",
+        action="store_true",
+        help="print the final run.json instead of the summary",
+    )
     run.set_defaults(func=_cmd_run)
 
     draw = sub.add_parser("draw", help="write the DAG as Mermaid")
@@ -383,6 +484,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--branches",
         action="store_true",
         help="also delete herda branches for this run",
+    )
+    clean.add_argument(
+        "--purge",
+        action="store_true",
+        help="remove the run directory after cleanup",
     )
     clean.add_argument("--force", action="store_true")
     clean.add_argument("--repo", default=".")

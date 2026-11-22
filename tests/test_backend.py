@@ -96,6 +96,17 @@ class BackendTests(unittest.TestCase):
 
         with mock.patch(
             "herda.backend.shutil.which", return_value="/bin/tool"
+        ), mock.patch.object(
+            self.backend.agent, "version", return_value="1.5.0"
+        ):
+            with self.assertLogs("herda", level="ERROR"):
+                with self.assertRaises(HerdrError) as caught:
+                    self.backend.preflight()
+        self.assertEqual(caught.exception.code, "missing_dependency")
+        self.assertIn("too old", caught.exception.message)
+
+        with mock.patch(
+            "herda.backend.shutil.which", return_value="/bin/tool"
         ), mock.patch(
             "herda.backend.subprocess.run", return_value=proc(1, err="down")
         ):
@@ -110,6 +121,8 @@ class BackendTests(unittest.TestCase):
         ), mock.patch(
             "herda.backend.subprocess.run",
             return_value=proc(0, out=json.dumps({"version": "1.2"})),
+        ), mock.patch.object(
+            self.backend.agent, "version", return_value="1.6.0"
         ):
             self.backend.preflight()
         self.assertEqual(self.backend._hc_version, "1.2")
@@ -118,6 +131,8 @@ class BackendTests(unittest.TestCase):
             "herda.backend.shutil.which", return_value="/bin/tool"
         ), mock.patch(
             "herda.backend.subprocess.run", return_value=proc(0, out="nope")
+        ), mock.patch.object(
+            self.backend.agent, "version", return_value="1.6.0"
         ):
             self.backend.preflight()
         self.assertIsNone(self.backend._hc_version)
@@ -239,6 +254,18 @@ class BackendTests(unittest.TestCase):
                     "reported": True,
                     "labels": {"x": "y"},
                 },
+                {
+                    "address": "t2",
+                    "state": "live",
+                    "status": "working",
+                    "turn": 2,
+                },
+                {
+                    "address": "t3",
+                    "state": "live",
+                    "status": None,
+                    "turn": 0,
+                },
                 "not-a-dict",
             ]
         }
@@ -247,8 +274,10 @@ class BackendTests(unittest.TestCase):
             return_value=proc(0, out=json.dumps(payload)),
         ) as run:
             terminals = self.backend.list({"owner": "herda"})
-        self.assertEqual(len(terminals), 1)
+        self.assertEqual(len(terminals), 3)
         self.assertEqual(terminals[0].status, "idle")
+        self.assertEqual(terminals[1].status, "working")
+        self.assertIsNone(terminals[2].status)
         self.assertIn("--label", run.call_args.args[0])
         with mock.patch(
             "herda.backend.subprocess.run", return_value=proc(0, out="[]")

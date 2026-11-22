@@ -9,4 +9,13 @@ Add a small command-line interface to `hello.py`:
 - Keep `greet(name: str = "world") -> str` as the reusable function.
 - Do not add tests or a README in this step.
 
-Run both commands and verify their output. Reply with a short summary.
+Run both commands and verify their output.
+
+Commit the change on the current branch:
+
+```bash
+git add hello.py
+git commit -m "add CLI"
+```
+
+Reply with a short summary and the commit hash.
