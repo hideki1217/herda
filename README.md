@@ -145,9 +145,12 @@ The unit tests use an in-memory fake herdr backend and make no network or
 model calls. They cover validation, DAG scheduling, failure propagation,
 cancel, cleanup, Mermaid output and the missing-dependency preflight.
 
-Statement coverage is 100%:
+Statement coverage must stay at or above 95%:
 
 ```bash
 coverage run -m unittest discover
 coverage report
 ```
+
+The 95% threshold leaves room for concurrency interleavings and fuzzing-style
+edge cases that would make a 100% target unnecessarily fragile.

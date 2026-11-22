@@ -372,6 +372,18 @@ class Execution:
                                 start_index + offset + 1
                             ) % len(kernels)
 
+                    for kernel in launches:
+                        thread = threading.Thread(
+                            target=self._run_kernel,
+                            args=(kernel,),
+                            name=f"herda-{kernel.qualified_name}",
+                            daemon=True,
+                        )
+                        self._threads.append(thread)
+                        # Start under the condition lock so cancel() cannot
+                        # snapshot a running kernel before its worker exists.
+                        thread.start()
+
                     if launches:
                         self._cond.notify_all()
                     elif not running:
@@ -395,16 +407,6 @@ class Execution:
                         self._cond.wait(0.3)
                         continue
 
-                for kernel in launches:
-                    thread = threading.Thread(
-                        target=self._run_kernel,
-                        args=(kernel,),
-                        name=f"herda-{kernel.qualified_name}",
-                        daemon=True,
-                    )
-                    with self._cond:
-                        self._threads.append(thread)
-                    thread.start()
         except BaseException as exc:  # noqa: BLE001
             log.exception("scheduler crashed")
             with self._cond:

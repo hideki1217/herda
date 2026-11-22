@@ -108,6 +108,7 @@ class SessionRunner:
         output_path: Path | None = None
 
         try:
+            self._check_cancel()
             self._launch()
             info = self._wait_ready()
             self._label_state("ready")

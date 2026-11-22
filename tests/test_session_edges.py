@@ -198,6 +198,19 @@ class SessionEdgeTests(RepoCase):
         self.assertEqual(outcome.state, KernelState.canceled)
         self.assertEqual(outcome.error.code, "canceled")
 
+    def test_cancel_wins_over_session_failure(self) -> None:
+        backend = ScriptedBackend()
+        runner, _, _ = self.make_runner(backend)
+
+        def send(terminal, text, *, timeout_s, wait):
+            runner.cancel_event.set()
+            raise HerdrError("send_failed", "no")
+
+        backend.send = send  # type: ignore[method-assign]
+        outcome = runner.run()
+        self.assertEqual(outcome.state, KernelState.canceled)
+        self.assertEqual(outcome.error.code, "canceled")
+
     def test_internal_crash(self) -> None:
         backend = ScriptedBackend(run_error=RuntimeError("boom"))
         runner, _, _ = self.make_runner(backend)

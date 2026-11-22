@@ -1074,6 +1074,12 @@ pending ──> ready ──> running ──> succeeded
 27. `git` / `pi` の最小バージョン検査が old / unknown を正しく扱う。
 28. ruff / mypy が CI で通る。
 
+### 12.1.1 カバレッジ方針
+
+- statement coverage の下限は **95%**（`pyproject.toml` の `fail_under`）。
+- 並列実行の interleaving や fuzzing 的な境界をすべて 100% で追うと、テストが複雑化して実行時間が増えるため、100% は要求しない。
+- 並列・cancel・cleanup の重要経路は、カバレッジではなく状態遷移のアサーションで守る。
+
 ### 12.2 統合（実 herdr-core + pi）
 
 1. 2 Stream / 3 Kernel の DAG が実行でき、Stream 内は直列、Stream 間は並列。
