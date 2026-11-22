@@ -270,7 +270,9 @@ def remove_engine_dir(worktree: str | Path) -> None:
         ) from exc
 
 
-def write_large_prompt(worktree: str | Path, stream: str, kernel: str, text: str) -> Path:
+def write_large_prompt(
+    worktree: str | Path, stream: str, kernel: str, text: str
+) -> Path:
     target = (
         Path(worktree)
         / ".herda"

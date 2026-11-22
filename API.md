@@ -257,6 +257,7 @@ class Graph:
     def stream(self, name: str, *, base: str = "HEAD") -> Stream: ...
 
     def validate(self) -> None: ...
+    def validate_models(self) -> None: ...
     def start(self) -> Execution: ...
     def run(self) -> Execution: ...
 
@@ -299,6 +300,7 @@ class Graph:
 - `stream()` / `kernel()` は `start()` 前に呼ぶ。`start()` 後の変更は `ValidationError`。
 - `start()` が成功した Graph は 1 回だけ実行できる。validate / preflight / lock / worktree 作成の失敗では `_start_attempted` を戻すため、修正後に同じ Graph で再試行できる。
 - `validate()` は副作用なし。名前、重複、空 Graph / Stream、循環、prompt、モデル、git を検査する。
+- `validate_models()` は `pi --list-models` と照合する。モデルが無い／一覧を読めない場合は `ValidationError`。既定の `validate()` / `start()` には含めず、`herda validate --models` などで明示的に使う。
 - `start()` は validate、worktree 作成、prompt スナップショットを行ってから実行を開始し、`Execution` を返す。
 - `run()` は `start()` + `wait()`。
 - Kernel の失敗は例外ではなく `KernelResult` に記録し、`RunState.failed` を返す。preflight 失敗だけが例外。
@@ -595,10 +597,10 @@ herdr-core の OSC 7501 だけを使う。
 3. `hc send --wait` で prompt を投入する。
    - `started=false`: 15 秒まで `turn` / `working` を再観測。進まなければ失敗（`agent_not_started`）。
    - `started=null`: OSC 7501 非対応 → 失敗（`status_unavailable`）。
-4. `hc send --wait` が `ended=false` で戻ったら、`session_timeout_s` まで `hc wait` を繰り返す。
+4. `hc send --wait` が `ended=false` で戻ったら、`hc wait --timeout 5` で状態変化を待ち、戻るたびに `hc get` で `reported` / `turn` / `status` を確認する。`session_timeout_s` までこれを繰り返す。
 5. `turn > T0` かつ状態が `working` でなくなったら完了。
    - `idle` / `done` → 成功。
-   - `blocked` → `awaiting_input`。blocked のままなら 0.5–1 秒間隔で `hc get` をポーリングし、状態が変わるまで待つ。解決後に `working` → `idle` を待つ。
+   - `blocked` → `awaiting_input`。`hc wait` で状態変化を待ち、解決後に `working` → `idle` を待つ。
    - `error` → 失敗。
    - `idle` / `done` でも `turn` が進んでいない → 失敗（`agent_not_started`）。
    - terminal が `finished` → 失敗。
@@ -840,11 +842,12 @@ Python ライブラリが主。CLI は最小限。
 
 ```bash
 herda doctor [--deep] [--app] [--json]
-herda validate graph.py
+herda validate graph.py [--models]      # --models: pi --list-models と照合
 herda run graph.py [--timeout SECONDS]  # 完了までブロック
 herda status [RUN_ID] [--json]          # run.json を表示
 herda draw graph.py -o dag.mmd
 herda clean RUN_ID [--worktrees] [--branches] [--force]
+herda clean --orphans [--branches] [--force]  # run.json のない worktree / branch を回収
 
 # ホスト側のみ。remote の space/tab 名を herda.* labels に合わせる（予定）
 herda app-sync
@@ -988,6 +991,18 @@ pending ──> ready ──> running ──> succeeded
 - cleanup の途中で 1 terminal の kill / rm が失敗しても、他の terminal と worktree の cleanup は続行し、失敗をログに残す。
 - cleanup 後に残る `run.json` / `screen.txt` / `meta.json` は監査用に保持する。
 
+### 10.7.1 Orphan recovery
+
+`herda clean --orphans` は、run.json を失った worktree を回収する。`--branches` を付けると orphan branch も削除する。
+
+- 対象 worktree: `<repo>/.herda/worktrees/<graph_slug>/<run_id>/<stream_slug>/` にあり、`<repo>/.herda/runs/<run_id>/run.json` が存在しないもの。
+- `branches=True` のとき、`herda/<graph_slug>/<stream_slug>-<run6>` で `runs/*-<run6>/run.json` が存在しない branch も削除する。
+- 対象 graph の `<repo>/.herda/locks/<graph_slug>.lock` が保持されている場合は、起動中の run とみなして skip する。
+- dirty worktree は `--force` がない限り skip する。
+- 削除対象は `.herda/worktrees` 配下と `herda/` branch prefix に限定する。
+- orphan terminal は labels の `herda.run` で見つかった場合だけ best effort で kill / rm する。
+- 処理は冪等で、再実行しても安全。orphan worktree の削除後に `git worktree prune` を実行する。
+
 ### 10.8 永続化と観測
 
 - `run.json` は atomic write（temp + rename）する。書き込み失敗は run を失敗させない。
@@ -1039,6 +1054,9 @@ pending ──> ready ──> running ──> succeeded
 16. `NaN` / `inf` の timeout が `ValidationError` になる。
 17. agent adapter が `--session-dir` / `agent_args` / `env` / `PI_PROGRAM_STATUS=1` を組み立てる。
 18. `herda status` が run.json を読み取り専用で表示する。
+19. `cleanup_orphans` が run.json のない worktree / branch を回収し、active lock / dirty worktree を skip する。
+20. `validate_models()` が `pi --list-models` の exact / pattern / fuzzy を照合する。
+21. ruff / mypy が CI で通る。
 
 ### 12.2 統合（実 herdr-core + pi）
 
@@ -1077,7 +1095,7 @@ pending ──> ready ──> running ──> succeeded
 
 ### 13.2 既知の制限
 
-- engine が死ぬと DAG は止まる。herdr terminal は生き残るので `hc attach` で状態を見られるが、次の Kernel には進まない。残った terminal / worktree は `herda clean RUN_ID [--worktrees] [--branches]` で片付ける。
+- engine が死ぬと DAG は止まる。herdr terminal は生き残るので `hc attach` で状態を見られるが、次の Kernel には進まない。残った terminal / worktree は `herda clean RUN_ID [--worktrees] [--branches]`、run.json を失ったものは `herda clean --orphans`（branch もなら `--branches`）で片付ける。
 - Pi の session は `<run_dir>/agent-sessions/<stream>/` に隔離される。同じ worktree で手動 pi を動かしても、herda の `--session-dir` とは混ざらない。
 - herdr app の space/tab 名は、`herdr-app` CLI が使えないと既定名になる。
 - `blocked` は既定で `blocked_timeout_s=3600`。`None` を指定した場合だけユーザーが cancel するまで待つ。
@@ -1093,6 +1111,7 @@ pending ──> ready ──> running ──> succeeded
 - host 側 herda から herdr machine を操作する対応（container 内で動かす §8.3 は v0.1 の範囲）
 - DOT / SVG
 - app mod による `herda.*` labels の表示
+- `hc connect` の persistent client 化（現在は `hc wait` + `hc get`）
 
 ### 13.4 未決
 

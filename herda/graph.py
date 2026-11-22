@@ -11,6 +11,7 @@ from types import MappingProxyType
 from typing import Literal, Mapping, Sequence
 
 from . import app
+from .agent import PiAgent
 from .backend import Backend, HcBackend
 from .cleanup import cleanup_run
 from .errors import ValidationError
@@ -21,10 +22,14 @@ from .mermaid import to_mermaid
 from .naming import (
     short_hash,
     slugify,
-    space_id as make_space_id,
-    tab_id as make_tab_id,
     terminal_name,
     validate_name,
+)
+from .naming import (
+    space_id as make_space_id,
+)
+from .naming import (
+    tab_id as make_tab_id,
 )
 from .prompt import load_prompt, prompt_sha256
 from .store import GraphLock, RunStore
@@ -97,9 +102,11 @@ class Graph:
             Path.cwd() if base_dir is None else Path(base_dir)
         ).expanduser().resolve()
         self.max_parallel = max_parallel
-        self.ready_timeout_s = validate_timeout(
+        ready_timeout = validate_timeout(
             "ready_timeout_s", ready_timeout_s, allow_none=False
         )
+        assert ready_timeout is not None
+        self.ready_timeout_s = ready_timeout
         self.session_timeout_s = validate_timeout(
             "session_timeout_s", session_timeout_s
         )
@@ -208,6 +215,35 @@ class Graph:
         kernels = kernel.stream.kernels
         index = kernels.index(kernel)
         return kernels[index - 1] if index > 0 else None
+
+    def validate_models(self) -> None:
+        """Check kernel models against ``pi --list-models``.
+
+        Model patterns are accepted using :meth:`PiAgent.model_available`.
+        This is a pre-run check; it is intentionally not part of the default
+        ``validate()`` so offline/custom setups can still use the DAG.
+        """
+
+        available = PiAgent().list_models()
+        if available is None:
+            raise ValidationError(
+                "model_list_unavailable",
+                "could not read 'pi --list-models'",
+                "check that Pi is installed and authenticated",
+            )
+        missing = sorted(
+            {
+                kernel.model
+                for kernel in self._kernels.values()
+                if not PiAgent.model_available(kernel.model, available)
+            }
+        )
+        if missing:
+            raise ValidationError(
+                "model_unknown",
+                "models not available from pi: " + ", ".join(missing),
+                "run 'pi --list-models' and use an available id",
+            )
 
     def _check_cycles(self) -> None:
         visiting: set[str] = set()

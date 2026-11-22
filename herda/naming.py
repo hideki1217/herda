@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import re
 import unicodedata
+from typing import Any, cast
 
 MAX_NAME_LENGTH = 64
 
@@ -124,7 +125,7 @@ def iso_utc(value: object) -> str | None:
         return None
     if not hasattr(value, "astimezone"):
         return None
-    dt = value.astimezone(timezone.utc)  # type: ignore[union-attr]
+    dt = cast(Any, value).astimezone(timezone.utc)
     return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 

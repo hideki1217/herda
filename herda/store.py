@@ -117,7 +117,7 @@ class GraphLock:
 
     def __init__(self, path: Path) -> None:
         self.path = path
-        self._fh = None
+        self._fh: Any | None = None
 
     def acquire(self) -> None:
         import fcntl

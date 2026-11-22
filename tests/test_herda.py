@@ -24,7 +24,6 @@ from herda import (
 )
 from herda.backend import HcBackend
 from herda.cli import main as cli_main
-from herda.session import START_OBSERVE_S
 
 from .fake_backend import FakeBackend
 
@@ -240,7 +239,7 @@ class MermaidTests(RepoCase):
     def test_snapshot(self) -> None:
         graph = self.graph()
         api = graph.stream("api", base="main")
-        design = api.kernel("design", self.prompt)
+        api.kernel("design", self.prompt)
         design_done = api.record_event("design_done")
         api.kernel("implement", self.prompt)
         web = graph.stream("web", base="main")
@@ -267,7 +266,7 @@ class ExecutionTests(RepoCase):
         backend = FakeBackend()
         graph = self.graph(_backend=backend)
         api = graph.stream("api", base="main")
-        design = api.kernel("design", self.prompt)
+        api.kernel("design", self.prompt)
         design_done = api.record_event("design_done")
         api.kernel("implement", self.prompt)
         api.kernel("test", self.prompt)
@@ -315,7 +314,7 @@ class ExecutionTests(RepoCase):
         graph = self.graph(_backend=backend)
         api = graph.stream("api", base="main")
         api.kernel("good", self.prompt)
-        failing = api.kernel("fail", self.prompt)
+        api.kernel("fail", self.prompt)
         failed = api.record_event("fail_done")
         api.kernel("downstream", self.prompt)
         web = graph.stream("web", base="main")

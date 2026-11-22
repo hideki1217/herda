@@ -16,7 +16,7 @@ from pathlib import Path
 
 from . import app
 from .backend import HcBackend
-from .cleanup import cleanup_run, validate_run_id
+from .cleanup import cleanup_orphans, cleanup_run, validate_run_id
 from .doctor import print_checks, run_doctor
 from .errors import HerdaError, HerdaTimeoutError
 from .graph import Graph
@@ -88,6 +88,8 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 def _cmd_validate(args: argparse.Namespace) -> int:
     graph = _load_graph(args.graph)
     graph.validate()
+    if getattr(args, "models", False):
+        graph.validate_models()
     print(
         f"ok: graph {graph.name!r} "
         f"({len(graph.streams)} streams, {len(graph.kernels)} kernels)"
@@ -162,6 +164,22 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 
 def _cmd_clean(args: argparse.Namespace) -> int:
+    if getattr(args, "orphans", False):
+        worktrees, branches = cleanup_orphans(
+            Path(args.repo),
+            force=args.force,
+            branches=getattr(args, "branches", False),
+        )
+        print(
+            f"removed {worktrees} orphan worktrees and "
+            f"{branches} orphan branches"
+        )
+        return 0
+    if not args.run_id:
+        raise HerdaError(
+            "run_id_required",
+            "herda clean needs RUN_ID or --orphans",
+        )
     cleanup_run(
         Path(args.repo),
         args.run_id,
@@ -328,6 +346,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     validate = sub.add_parser("validate", help="validate a graph module")
     validate.add_argument("graph")
+    validate.add_argument(
+        "--models",
+        action="store_true",
+        help="also check model ids with 'pi --list-models'",
+    )
     validate.set_defaults(func=_cmd_validate)
 
     run = sub.add_parser("run", help="run a graph until it finishes")
@@ -349,7 +372,12 @@ def build_parser() -> argparse.ArgumentParser:
     draw.set_defaults(func=_cmd_draw)
 
     clean = sub.add_parser("clean", help="clean terminals/worktrees of a run")
-    clean.add_argument("run_id")
+    clean.add_argument("run_id", nargs="?")
+    clean.add_argument(
+        "--orphans",
+        action="store_true",
+        help="remove worktrees/branches that have no run.json",
+    )
     clean.add_argument("--worktrees", action="store_true")
     clean.add_argument(
         "--branches",

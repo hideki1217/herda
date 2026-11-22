@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import os
 import time
-import unittest
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from herda import (
@@ -18,7 +16,6 @@ from herda import (
     RunState,
     ValidationError,
 )
-from herda.kernel import Kernel
 
 from .fake_backend import FakeBackend
 from .test_herda import RepoCase, _git
@@ -156,6 +153,30 @@ class GraphEdgeTests(RepoCase):
         ):
             with self.assertRaises(ValidationError):
                 graph.validate()
+
+    def test_validate_models(self) -> None:
+        graph = self.graph()
+        graph.stream("api").kernel("a", self.prompt)
+        with mock.patch(
+            "herda.graph.PiAgent.list_models", return_value=None
+        ):
+            with self.assertRaises(ValidationError) as caught:
+                graph.validate_models()
+        self.assertEqual(caught.exception.code, "model_list_unavailable")
+
+        with mock.patch(
+            "herda.graph.PiAgent.list_models",
+            return_value={"other/model"},
+        ):
+            with self.assertRaises(ValidationError) as caught:
+                graph.validate_models()
+        self.assertEqual(caught.exception.code, "model_unknown")
+
+        with mock.patch(
+            "herda.graph.PiAgent.list_models",
+            return_value={"anthropic/claude-sonnet-5-5"},
+        ):
+            graph.validate_models()
 
     def test_previous_kernel_and_repr(self) -> None:
         graph = self.graph()

@@ -48,6 +48,51 @@ class PiAgentTests(unittest.TestCase):
         ):
             self.assertIsNone(agent.version())
 
+    def test_list_models_and_availability(self) -> None:
+        agent = PiAgent("pi")
+        with mock.patch("herda.agent.shutil.which", return_value=None):
+            self.assertIsNone(agent.list_models())
+
+        agent.path = "/bin/pi"
+        output = (
+            "provider   model                         context\n"
+            "fireworks  accounts/models/one            1M\n"
+            "\n"
+            "fireworks  accounts/models/two            1M\n"
+        )
+        with mock.patch(
+            "herda.agent.subprocess.run",
+            return_value=proc(0, out=output),
+        ):
+            models = agent.list_models()
+        self.assertEqual(
+            models,
+            {
+                "fireworks/accounts/models/one",
+                "fireworks/accounts/models/two",
+            },
+        )
+        with mock.patch(
+            "herda.agent.subprocess.run", side_effect=OSError("no")
+        ):
+            self.assertIsNone(agent.list_models())
+        with mock.patch(
+            "herda.agent.subprocess.run", return_value=proc(1)
+        ):
+            self.assertIsNone(agent.list_models())
+
+        available = {"fireworks/accounts/models/one"}
+        self.assertTrue(
+            PiAgent.model_available("fireworks/accounts/models/one", available)
+        )
+        self.assertTrue(
+            PiAgent.model_available("fireworks/accounts/models/one:high", available)
+        )
+        self.assertTrue(PiAgent.model_available("*models/one", available))
+        self.assertTrue(PiAgent.model_available("one", available))
+        self.assertFalse(PiAgent.model_available("", available))
+        self.assertFalse(PiAgent.model_available("missing", available))
+
     def test_launch_argv(self) -> None:
         agent = PiAgent("pi")
         agent.path = "/bin/pi"

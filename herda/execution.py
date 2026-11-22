@@ -55,7 +55,7 @@ class Execution:
         self.finished_at: datetime | None = None
         self._state = RunState.running
         self._store = store
-        self._lock = lock
+        self._lock: GraphLock | None = lock
         self._backend = backend
         self._streams = streams
         self._prompt_texts = prompt_texts

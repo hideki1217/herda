@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import threading
-import unittest
-from unittest import mock
 from pathlib import Path
+from unittest import mock
+
 from herda.backend import SendOutcome, TerminalInfo, WaitOutcome
 from herda.errors import HerdrError
-from herda.session import SessionRunner
+from herda.session import SessionRunner, _SessionFailure
 from herda.store import RunStore
 from herda.types import KernelState
 
@@ -456,6 +456,21 @@ class SessionEdgeTests(RepoCase):
         self.assertEqual(outcome.state, KernelState.succeeded)
         self.assertEqual(backend.killed, ["t1"])
 
+    def test_wait_errors_fall_back_to_get(self) -> None:
+        class WaitErrorBackend(ScriptedBackend):
+            def wait(self, terminal: str, *, timeout_s: float):
+                raise HerdrError("wait_failed", "no")
+
+        backend = WaitErrorBackend(
+            gets=[info("idle"), info("working")],
+            send_result=SendOutcome(
+                True, "working", 0, wait_outcome("working", 0, ended=False)
+            ),
+        )
+        with self.assertLogs("herda", level="DEBUG"):
+            outcome = self.make_runner(backend)[0].run()
+        self.assertEqual(outcome.state, KernelState.failed)
+
     def test_get_errors_and_missing_terminal(self) -> None:
         not_found = ScriptedBackend(
             gets=[HerdrError("terminal_not_found", "gone")]
@@ -468,7 +483,7 @@ class SessionEdgeTests(RepoCase):
             self.make_runner(other)[0].run().error.code, "herdr"
         )
         runner, _, _ = self.make_runner(ScriptedBackend())
-        with self.assertRaises(Exception):
+        with self.assertRaises(_SessionFailure):
             runner._terminal_required()
         self.assertIsNone(runner._save_screen())
         runner._label_state("x")

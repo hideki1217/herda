@@ -103,9 +103,12 @@ does not depend on Pi's global session history.
 ## Operations
 
 ```bash
+herda validate graph.py --models     # check model ids with pi --list-models
 herda status [RUN_ID] [--json]       # inspect run.json
 herda clean RUN_ID --worktrees       # remove worktrees for a finished run
 herda clean RUN_ID --worktrees --branches  # also remove herda/* branches
+herda clean --orphans                # recover worktrees without run.json
+herda clean --orphans --branches     # also remove orphan herda/* branches
 ```
 
 ## Examples
@@ -123,7 +126,10 @@ HERDA_MODEL=<provider/model> ./run.sh
 
 ```bash
 pip install -e '.[dev]'
-python -m unittest discover -v
+ruff check herda tests
+mypy herda
+coverage run -m unittest discover -v
+coverage report -m
 ```
 
 The unit tests use an in-memory fake herdr backend and make no network or

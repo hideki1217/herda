@@ -258,6 +258,32 @@ class SessionRunner:
 
     # -- readiness -------------------------------------------------------
 
+    def _wait_for_change(
+        self,
+        timeout_s: float | None,
+        *,
+        slice_s: float,
+    ) -> None:
+        """Block on ``hc wait`` instead of busy-polling ``hc get``.
+
+        The wait result is intentionally ignored; the caller re-reads the
+        terminal afterwards because ``hc get`` also carries ``reported`` and
+        the labels used by the state machine.
+        """
+
+        waiter = getattr(self.backend, "wait", None)
+        if waiter is None:
+            # Test/custom backends without a wait primitive still work.
+            time.sleep(max(0.0, min(0.25, slice_s)))
+            return
+        if timeout_s is not None:
+            slice_s = min(slice_s, max(0.05, timeout_s))
+        try:
+            waiter(self._terminal_required(), timeout_s=slice_s)
+        except Exception as exc:  # noqa: BLE001 - get is the source of truth
+            log.debug("hc wait failed on %s: %s", self.terminal, exc)
+            time.sleep(max(0.0, min(0.25, slice_s)))
+
     def _observe_timeouts(self, info: TerminalInfo) -> None:
         now = time.monotonic()
         if info.reported:
@@ -332,7 +358,11 @@ class SessionRunner:
                     "agent_not_ready",
                     "agent did not become idle before the ready timeout",
                 )
-            time.sleep(0.25)
+            if blocked_seen:
+                self._wait_for_change(None, slice_s=5.0)
+            else:
+                remaining = max(0.0, deadline - time.monotonic())
+                self._wait_for_change(remaining, slice_s=1.0)
 
     # -- prompt + completion --------------------------------------------
 
@@ -403,7 +433,7 @@ class SessionRunner:
             self.status = info.status or self.status
             if info.turn > t0 or info.status == "working":
                 return
-            time.sleep(0.25)
+            self._wait_for_change(None, slice_s=0.5)
         raise _SessionFailure(
             "agent_not_started",
             "agent did not start working after the prompt was sent",
@@ -471,7 +501,12 @@ class SessionRunner:
                 raise _SessionFailure(
                     "timeout", "session timeout exceeded"
                 )
-            time.sleep(0.25)
+            remaining = (
+                None
+                if session_deadline is None
+                else session_deadline - time.monotonic()
+            )
+            self._wait_for_change(remaining, slice_s=5.0)
 
     def _wait_out_of_blocked(
         self, session_deadline: float | None
@@ -491,7 +526,12 @@ class SessionRunner:
                 raise _SessionFailure(
                     "timeout", "session timeout exceeded while blocked"
                 )
-            time.sleep(0.5)
+            remaining = (
+                None
+                if session_deadline is None
+                else session_deadline - time.monotonic()
+            )
+            self._wait_for_change(remaining, slice_s=5.0)
 
     # -- helpers ---------------------------------------------------------
 

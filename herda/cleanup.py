@@ -13,6 +13,7 @@ from .errors import CleanupError, HerdrError
 from .store import (
     acquire_cleanup_lock,
     atomic_write_json,
+    lock_is_held,
     read_json,
 )
 from .worktree import (
@@ -21,6 +22,7 @@ from .worktree import (
     remove_engine_dir,
     remove_worktree,
     require_git_repo,
+    run_git,
     worktree_is_dirty,
 )
 
@@ -298,6 +300,124 @@ def cleanup_worktrees(
             )
         remove_engine_dir(path)
         remove_worktree(repo, path, force=force)
+
+
+def cleanup_orphans(
+    repo: str | Path,
+    *,
+    force: bool = False,
+    branches: bool = False,
+    backend: Any | None = None,
+) -> tuple[int, int]:
+    """Remove worktrees/branches that have no matching run.json.
+
+    A worktree is orphaned when it lives under
+    ``.herda/worktrees/<graph_slug>/<run_id>/`` and ``runs/<run_id>/run.json``
+    is missing. A graph lock held for the graph slug is treated as an active
+    run and skipped. Branches are orphaned when no run directory has the
+    branch's ``run6`` suffix.
+    """
+
+    root = require_git_repo(repo)
+    herda_dir = root / ".herda"
+    runs_dir = herda_dir / "runs"
+    owned_root = (herda_dir / "worktrees").resolve()
+    locks_dir = herda_dir / "locks"
+
+    worktrees: list[Path] = []
+    if owned_root.exists():
+        proc = run_git(root, "worktree", "list", "--porcelain")
+        for line in proc.stdout.splitlines():
+            if line.startswith("worktree "):
+                worktrees.append(
+                    Path(line[len("worktree "):]).resolve()
+                )
+
+    removed_worktrees = 0
+    for path in worktrees:
+        try:
+            relative = path.relative_to(owned_root)
+        except ValueError:
+            continue
+        parts = relative.parts
+        if len(parts) != 3:
+            log.warning("ignoring unexpected orphan path shape: %s", path)
+            continue
+        graph_slug, run_id, _stream_slug = parts
+        if not _GRAPH_SLUG_RE.fullmatch(graph_slug):
+            log.warning("ignoring orphan with invalid graph slug: %s", path)
+            continue
+        if not _RUN_ID_RE.fullmatch(run_id):
+            log.warning("ignoring orphan with invalid run id: %s", path)
+            continue
+        if (runs_dir / run_id / "run.json").exists():
+            continue
+        if lock_is_held(locks_dir / f"{graph_slug}.lock"):
+            log.info("skipping orphan worktree with active lock: %s", path)
+            continue
+        if worktree_is_dirty(path) and not force:
+            log.warning(
+                "skipping dirty orphan worktree (use --force): %s", path
+            )
+            continue
+        try:
+            cleanup_terminals([], run_id=run_id, backend=backend)
+        except Exception as exc:  # noqa: BLE001 - best effort
+            log.debug("could not clean orphan terminals for %s: %s", run_id, exc)
+        remove_engine_dir(path)
+        remove_worktree(root, path, force=force)
+        removed_worktrees += 1
+        log.info("removed orphan worktree: %s", path)
+
+    removed_branches = 0
+    if branches:
+        branch_list = run_git(
+            root,
+            "branch",
+            "--format=%(refname:short)",
+            "--list",
+            "herda/*",
+        ).stdout.splitlines()
+        for branch in branch_list:
+            branch = branch.strip()
+            if not branch.startswith("herda/"):
+                continue
+            tail = branch[len("herda/"):]
+            if "/" not in tail:
+                continue
+            graph_slug, rest = tail.split("/", 1)
+            if not _GRAPH_SLUG_RE.fullmatch(graph_slug):
+                continue
+            if "-" not in rest:
+                continue
+            _stream_slug, run6 = rest.rsplit("-", 1)
+            if not re.fullmatch(r"[0-9a-f]{6}", run6):
+                continue
+            if lock_is_held(locks_dir / f"{graph_slug}.lock"):
+                log.info(
+                    "skipping orphan branch with active lock: %s", branch
+                )
+                continue
+            if any(
+                (path / "run.json").exists()
+                for path in runs_dir.glob(f"*-{run6}")
+            ):
+                continue
+            try:
+                result = delete_branch(root, branch)
+            except Exception as exc:  # noqa: BLE001 - best effort
+                log.warning(
+                    "could not delete orphan branch %s: %s", branch, exc
+                )
+                continue
+            if getattr(result, "returncode", 0) == 0:
+                removed_branches += 1
+                log.info("removed orphan branch: %s", branch)
+            else:
+                log.warning("could not delete orphan branch: %s", branch)
+
+    prune_worktrees(root)
+    return (removed_worktrees, removed_branches)
 
 
 def _now_iso() -> str:

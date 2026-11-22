@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -11,12 +10,13 @@ from unittest import mock
 from herda import CleanupError, HerdrError
 from herda.backend import TerminalInfo
 from herda.cleanup import (
+    cleanup_orphans,
     cleanup_run,
     cleanup_terminals,
     cleanup_worktrees,
 )
 
-from .test_herda import RepoCase
+from .test_herda import RepoCase, _git
 
 RUN = "20260101T000000Z-abcdef"
 RUN_MISSING = "20260101T000003Z-abcdef"
@@ -27,6 +27,9 @@ RUN_BADSLUG = "20260101T000005Z-abcdef"
 RUN_TERMWARN = "20260101T000006Z-abcdef"
 RUN_BRANCH = "20260101T000007Z-abcdef"
 RUN_SHAPES = "20260101T000008Z-abcdef"
+RUN_ORPHAN = "20260101T000010Z-abcdef"
+RUN_EXISTING = "20260101T000011Z-123456"
+RUN_ORPHAN2 = "20260101T000012Z-abcdef"
 
 
 class FakeCleanupBackend:
@@ -274,6 +277,189 @@ class CleanupTests(RepoCase):
 
         with mock.patch("herda.cleanup.shutil.which", return_value=None):
             cleanup_terminals([], run_id=RUN)
+
+    def test_cleanup_orphans(self) -> None:
+        self.assertEqual(cleanup_orphans(self.repo), (0, 0))
+
+        orphan_wt = (
+            Path(self.repo)
+            / ".herda"
+            / "worktrees"
+            / "g"
+            / RUN_ORPHAN
+            / "s"
+        )
+        orphan_wt.parent.mkdir(parents=True)
+        _git(
+            self.repo,
+            "worktree",
+            "add",
+            "-b",
+            "herda/g/s-abcdef",
+            str(orphan_wt),
+            "main",
+        )
+        _git(self.repo, "branch", "herda/g/other-deadbe", "main")
+
+        existing_run = (
+            Path(self.repo) / ".herda" / "runs" / RUN_EXISTING
+        )
+        existing_run.mkdir(parents=True)
+        (existing_run / "run.json").write_text(
+            json.dumps(
+                {
+                    "run_id": RUN_EXISTING,
+                    "graph_slug": "g",
+                    "kernels": {},
+                    "streams": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        _git(self.repo, "branch", "herda/g/s-123456", "main")
+
+        removed = cleanup_orphans(
+            self.repo, branches=True, backend=FakeCleanupBackend()
+        )
+        self.assertEqual(removed, (1, 2))
+        self.assertFalse(orphan_wt.exists())
+        branches = _git(
+            self.repo, "branch", "--format=%(refname:short)", "--list", "herda/*"
+        ).stdout.splitlines()
+        self.assertIn("herda/g/s-123456", branches)
+        self.assertNotIn("herda/g/other-deadbe", branches)
+
+    def test_cleanup_orphans_dirty_and_locked(self) -> None:
+        orphan_wt = (
+            Path(self.repo)
+            / ".herda"
+            / "worktrees"
+            / "g"
+            / RUN_ORPHAN
+            / "s"
+        )
+        orphan_wt.parent.mkdir(parents=True)
+        _git(
+            self.repo,
+            "worktree",
+            "add",
+            "-b",
+            "herda/g/s-abcdef",
+            str(orphan_wt),
+            "main",
+        )
+        (orphan_wt / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+        with self.assertLogs("herda", level="WARNING"):
+            self.assertEqual(cleanup_orphans(self.repo), (0, 0))
+        self.assertTrue(orphan_wt.exists())
+
+        with mock.patch("herda.cleanup.lock_is_held", return_value=True):
+            self.assertEqual(cleanup_orphans(self.repo, force=True), (0, 0))
+        self.assertTrue(orphan_wt.exists())
+
+        self.assertEqual(
+            cleanup_orphans(
+                self.repo,
+                force=True,
+                branches=True,
+                backend=FakeCleanupBackend(),
+            ),
+            (1, 1),
+        )
+
+    def test_cleanup_orphans_invalid_paths_and_terminal_errors(self) -> None:
+        wt_root = Path(self.repo) / ".herda" / "worktrees"
+        wt_root.mkdir(parents=True)
+        existing_run = Path(self.repo) / ".herda" / "runs" / RUN_EXISTING
+        existing_run.mkdir(parents=True)
+        (existing_run / "run.json").write_text("{}", encoding="utf-8")
+
+        paths = [
+            wt_root / "g" / RUN_ORPHAN / "s" / "extra",
+            wt_root / "BAD!" / RUN_ORPHAN / "s",
+            wt_root / "g" / "bad" / "s",
+            wt_root / "g" / RUN_EXISTING / "s",
+            Path(self.root) / "outside-wt",
+            wt_root / "g" / RUN_ORPHAN2 / "s",
+        ]
+        worktree_out = "\n".join(f"worktree {p}" for p in paths) + "\n"
+        with mock.patch(
+            "herda.cleanup.run_git",
+            side_effect=[
+                SimpleNamespace(stdout=worktree_out),
+                SimpleNamespace(stdout=""),
+            ],
+        ), mock.patch("herda.cleanup.prune_worktrees"), mock.patch(
+            "herda.cleanup.worktree_is_dirty", return_value=False
+        ), mock.patch(
+            "herda.cleanup.remove_engine_dir"
+        ) as remove_engine, mock.patch(
+            "herda.cleanup.remove_worktree"
+        ) as remove_worktree, mock.patch(
+            "herda.cleanup.cleanup_terminals", side_effect=RuntimeError("no")
+        ), self.assertLogs("herda", level="WARNING"):
+            self.assertEqual(cleanup_orphans(self.repo), (1, 0))
+        remove_engine.assert_called_once()
+        remove_worktree.assert_called_once()
+
+    def test_cleanup_orphans_branch_errors(self) -> None:
+        wt_root = Path(self.repo) / ".herda" / "worktrees"
+        wt_root.mkdir(parents=True)
+        run_dir = Path(self.repo) / ".herda" / "runs" / "x-abc123"
+        run_dir.mkdir(parents=True)
+        (run_dir / "run.json").write_text("{}", encoding="utf-8")
+        branch_out = "\n".join(
+            [
+                "not-herda",
+                "herda/noslash",
+                "herda/BAD!/x-abcdef",
+                "herda/g/nodash",
+                "herda/g/x-nothex",
+                "herda/g/x-abc123",
+                "herda/g/x-e00123",
+                "herda/g/x-f00123",
+                "herda/g/x-abc999",
+            ]
+        ) + "\n"
+
+        def delete(repo, branch):
+            if branch.endswith("e00123"):
+                raise RuntimeError("no")
+            if branch.endswith("f00123"):
+                return SimpleNamespace(returncode=1)
+            return SimpleNamespace(returncode=0)
+
+        with mock.patch(
+            "herda.cleanup.run_git",
+            side_effect=[
+                SimpleNamespace(stdout=""),
+                SimpleNamespace(stdout=branch_out),
+            ],
+        ), mock.patch("herda.cleanup.prune_worktrees"), mock.patch(
+            "herda.cleanup.lock_is_held", return_value=False
+        ), mock.patch(
+            "herda.cleanup.delete_branch", side_effect=delete
+        ) as delete_branch, self.assertLogs("herda", level="WARNING"):
+            self.assertEqual(
+                cleanup_orphans(self.repo, branches=True), (0, 1)
+            )
+        self.assertEqual(delete_branch.call_count, 3)
+
+        with mock.patch(
+            "herda.cleanup.run_git",
+            side_effect=[
+                SimpleNamespace(stdout=""),
+                SimpleNamespace(stdout="herda/g/x-abc999\n"),
+            ],
+        ), mock.patch("herda.cleanup.prune_worktrees"), mock.patch(
+            "herda.cleanup.lock_is_held", return_value=True
+        ), mock.patch(
+            "herda.cleanup.delete_branch"
+        ) as delete_branch:
+            self.assertEqual(
+                cleanup_orphans(self.repo, branches=True), (0, 0)
+            )
+        delete_branch.assert_not_called()
 
     def test_cleanup_branches(self) -> None:
         run_dir = Path(self.repo) / ".herda" / "runs" / RUN_BRANCH

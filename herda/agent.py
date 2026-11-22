@@ -7,6 +7,7 @@ need to know Pi command-line details.
 
 from __future__ import annotations
 
+import fnmatch
 import os
 import shutil
 import subprocess
@@ -46,6 +47,50 @@ class PiAgent:
             return None
         lines = (proc.stdout or proc.stderr).strip().splitlines()
         return lines[0] if lines else None
+
+    def list_models(self) -> set[str] | None:
+        """Return ``provider/model`` strings advertised by Pi."""
+
+        path = self.path or shutil.which(self.executable)
+        if path is None:
+            return None
+        try:
+            proc = subprocess.run(
+                [path, "--list-models"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if proc.returncode != 0:
+            return None
+        models: set[str] = set()
+        for line in (proc.stdout or "").splitlines():
+            line = line.strip()
+            if not line or line.startswith("provider"):
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                models.add(f"{parts[0]}/{parts[1]}")
+        return models
+
+    @staticmethod
+    def model_available(model: str, available: set[str]) -> bool:
+        """Accept exact ids, Pi patterns, and simple fuzzy names."""
+
+        base = model.split(":", 1)[0].strip()
+        if not base:
+            return False
+        if base in available:
+            return True
+        if any(char in base for char in "*?[]"):
+            return any(
+                fnmatch.fnmatchcase(candidate, base)
+                for candidate in available
+            )
+        return any(base in candidate for candidate in available)
 
     def launch_argv(
         self,

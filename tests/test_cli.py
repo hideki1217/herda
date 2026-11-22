@@ -7,8 +7,6 @@ import io
 import json
 import os
 import runpy
-import sys
-import unittest
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,12 +14,11 @@ from unittest import mock
 
 from herda import HerdaError, HerdaTimeoutError, KernelState, RunState
 from herda.backend import TerminalInfo
-from herda.doctor import Check
 from herda.cli import (
     _cmd_app_sync,
     _cmd_clean,
-    _cmd_draw,
     _cmd_doctor,
+    _cmd_draw,
     _cmd_run,
     _cmd_status,
     _cmd_validate,
@@ -31,6 +28,7 @@ from herda.cli import (
     _sync_once,
     main,
 )
+from herda.doctor import Check
 from herda.types import ErrorInfo, KernelResult
 
 from .test_herda import RepoCase
@@ -183,6 +181,17 @@ class CliTests(RepoCase):
             )
         self.assertIn("ok: graph", out.getvalue())
 
+        with mock.patch(
+            "herda.graph.Graph.validate_models"
+        ) as validate_models, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(
+                _cmd_validate(
+                    SimpleNamespace(graph=self.graph_path, models=True)
+                ),
+                0,
+            )
+        validate_models.assert_called_once()
+
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.assertEqual(
@@ -230,7 +239,9 @@ class CliTests(RepoCase):
                 "herda.cli.signal.getsignal", return_value=object()
             ), mock.patch(
                 "herda.cli.signal.signal",
-                side_effect=lambda sig, handler: handlers.append(handler),
+                side_effect=(
+                    lambda sig, handler, h=handlers: h.append(handler)
+                ),
             ), contextlib.redirect_stdout(io.StringIO()):
                 result = _cmd_run(SimpleNamespace(graph="g"))
             self.assertEqual(result, expected)
@@ -411,6 +422,42 @@ class CliTests(RepoCase):
         cleanup.assert_called_once()
         self.assertTrue(cleanup.call_args.kwargs["branches"])
         self.assertIn("cleaned run run", out.getvalue())
+
+    def test_cmd_clean_orphans_and_missing_run_id(self) -> None:
+        out = io.StringIO()
+        with mock.patch(
+            "herda.cli.cleanup_orphans", return_value=(2, 3)
+        ) as cleanup, contextlib.redirect_stdout(out):
+            self.assertEqual(
+                _cmd_clean(
+                    SimpleNamespace(
+                        repo=self.repo,
+                        run_id=None,
+                        orphans=True,
+                        force=False,
+                        worktrees=False,
+                        branches=False,
+                    )
+                ),
+                0,
+            )
+        cleanup.assert_called_once_with(
+            Path(self.repo), force=False, branches=False
+        )
+        self.assertIn("2 orphan worktrees and 3 orphan branches", out.getvalue())
+
+        with self.assertRaises(HerdaError) as caught:
+            _cmd_clean(
+                SimpleNamespace(
+                    repo=self.repo,
+                    run_id=None,
+                    orphans=False,
+                    force=False,
+                    worktrees=False,
+                    branches=False,
+                )
+            )
+        self.assertEqual(caught.exception.code, "run_id_required")
 
     def test_sync_once(self) -> None:
         class Backend:

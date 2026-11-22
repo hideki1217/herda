@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import errno
-import json
 import math
-import os
 import subprocess
 import tempfile
 import unittest
@@ -21,8 +19,9 @@ from herda import (
     PromptError,
     ValidationError,
     WorktreeError,
+    app,
+    worktree,
 )
-from herda import app
 from herda.mermaid import _escape, _short_model, to_mermaid
 from herda.naming import (
     iso_utc,
@@ -46,7 +45,6 @@ from herda.store import (
     read_json,
     run_document,
 )
-from herda import worktree
 from herda.timeouts import validate_timeout
 
 from .test_herda import RepoCase
