@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "herda"
+version = "0.1.0"
+description = "CUDA-like streams and kernels for coding agents, built on herdr-core"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "herda contributors" }]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Operating System :: POSIX",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "coverage>=7"]
+
+[project.scripts]
+herda = "herda.cli:main"
+
+[tool.setuptools]
+packages = ["herda"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["herda"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 100

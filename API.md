@@ -95,10 +95,11 @@ Python (herda)
 | graph | Graph |
 | stream | Stream = worktree |
 | kernel | Kernel = 1 prompt 実行 |
-| stream 内の順序 | 宣言順 |
+| stream 内の順序 | 宣言順（暗黙に直列） |
 | stream 間の並列 | `max_parallel` |
-| stream 間の同期 | `depends_on` |
-| device synchronize | `Execution.wait()` |
+| stream 間の同期 | `record_event` / `wait_event` / `wait_stream` |
+| stream synchronize | `Execution.wait_stream()` |
+| device synchronize | `Execution.wait()` / `synchronize()` |
 
 ---
 
@@ -106,11 +107,12 @@ Python (herda)
 
 1. **名前はユーザーが付ける。** Graph / Stream / Kernel の `name` は必須。herdr terminal 名など内部 ID だけ自動生成する。
 2. **Stream は worktree、Kernel はセッション。** 1 Stream 内は直列、異なる Stream は並列。
-3. **既定では会話を引き継がない。** 引き継ぎは `inherit_session=True` のときだけ。直前 Kernel の会話のみ。
-4. **worktree は herda が所有する。** ただし未コミット変更を破壊しない。削除は明示操作のみ。
-5. **完了は OSC 7501 だけを信じる。** 画面文字列で成功判定しない。
-6. **herdr app がライブ一覧。** herda は `herdr.space` / `herdr.tab` と表示名を整える。
-7. **v0.1 は小さく。** 再開、retry、result 判定などは入れない（§13）。
+3. **Stream 間の同期は event。** Kernel に `depends_on` は付けない。Stream が event を record し、別の Stream が wait する。
+4. **既定では会話を引き継がない。** 引き継ぎは `inherit_session=True` のときだけ。直前 Kernel の会話のみ。
+5. **worktree は herda が所有する。** ただし未コミット変更を破壊しない。削除は明示操作のみ。
+6. **完了は OSC 7501 だけを信じる。** 画面文字列で成功判定しない。
+7. **herdr app がライブ一覧。** herda は `herdr.space` / `herdr.tab` と表示名を整える。
+8. **v0.1 は小さく。** 再開、retry、result 判定などは入れない（§13）。
 
 名前は 1–64 Unicode 文字。制御文字と `/` は禁止（`/` は `stream/kernel` の区切り）。同じ階層で一意。
 
@@ -148,11 +150,13 @@ graph = Graph(
 
 api = graph.stream("api", base="main")
 design = api.kernel("design", "prompts/design.md")
-impl = api.kernel("implement", "prompts/implement.md", depends_on=[design])
-api.kernel("test", "prompts/test.md", depends_on=[impl])
+design_done = api.record_event("design_done")
+api.kernel("implement", "prompts/implement.md")
+api.kernel("test", "prompts/test.md")
 
 web = graph.stream("web", base="main")
-web.kernel("ui", "prompts/ui.md", depends_on=[design])
+web.wait_event(design_done)
+web.kernel("ui", "prompts/ui.md")
 
 execution = graph.run()          # 完了までブロック
 assert execution.state == RunState.succeeded
@@ -161,8 +165,10 @@ graph.draw("dag.mmd")
 ```
 
 - `api` と `web` は別 worktree / branch。
-- `api/design` 完了後、`api/implement` と `web/ui` が並列。
-- `api/implement` 完了後、`api/test`。
+- `api` 内は `design` → `implement` → `test` の順に直列。
+- `api/design` 完了時に `design_done` を record。
+- `web` は `design_done` を wait してから `ui` を開始する。
+- `design_done` は record した時点までの `api` の Kernel を表す。後から `api` に追加した Kernel は含まない。
 - `implement` は既定で `design` の会話を引き継がない。
 
 ### 4.3 引き継ぎ
@@ -173,7 +179,6 @@ design = api.kernel("design", "prompts/design.md")
 api.kernel(
     "implement",
     "prompts/implement.md",
-    depends_on=[design],
     inherit_session=True,
 )
 ```
@@ -200,7 +205,7 @@ herda draw graph.py -o dag.mmd
 
 ```python
 from herda import (
-    Graph, Stream, Kernel, Execution,
+    Graph, Stream, Kernel, Event, Execution,
     RunState, KernelState,
     KernelResult, ErrorInfo,
     HerdaError, ValidationError, PromptError, WorktreeError,
@@ -266,6 +271,8 @@ class Graph:
     def streams(self) -> Mapping[str, Stream]: ...
     @property
     def kernels(self) -> Mapping[str, Kernel]: ...
+    @property
+    def events(self) -> Mapping[str, Event]: ...
 ```
 
 | 引数 | 既定 | 意味 |
@@ -305,18 +312,29 @@ class Stream:
         prompt: str | Path,
         *,
         model: str | None = None,
-        depends_on: Iterable[Kernel | str] = (),
         inherit_session: bool = False,
         timeout_s: float | None = None,
     ) -> Kernel: ...
 
+    def record_event(self, name: str | None = None) -> Event: ...
+    def wait_event(self, event: Event) -> None: ...
+    def wait_stream(self, stream: Stream) -> None: ...
+
     @property
     def kernels(self) -> tuple[Kernel, ...]: ...
+    @property
+    def recorded_events(self) -> tuple[Event, ...]: ...
 ```
 
 - `base` は branch / tag / commit。`start()` 時に commit に固定する。
 - branch / worktree は自動決定（§7.1）。v0.1 では明示指定しない。
 - 空の Stream は `ValidationError`。
+- Stream 内の Kernel は宣言順に直列。Kernel に依存指定は無い。
+- `record_event(name=None)` はその時点の Stream の末尾を event として記録し、`Event` を返す。`name` を省略すると `event-<n>` が自動で付く。まだ Kernel が無い Stream でも record できる（待っても何も待たない）。
+- `wait_event(event)` は、この呼び出しより後に宣言する次の Kernel だけを event 完了まで待たせる。呼び出し前に宣言済みの Kernel には影響しない。
+- `wait_stream(stream)` は、呼び出し時点の `stream` の末尾 Kernel を待つ。`other.record_event()` + `self.wait_event()` の簡略形で、PyTorch/CUDA の `wait_stream` に相当する。呼び出し後に `stream` へ追加した Kernel は待たない。
+- 同じ Stream が自分の event / stream を wait しても no-op（Stream 内は既に直列）。
+- event 名は Graph 内で一意。`start()` 後の record / wait は `ValidationError`。
 
 ### 5.5 `Kernel`
 
@@ -328,7 +346,6 @@ class Kernel:
     name: str
     prompt: Path
     model: str
-    dependencies: tuple[Kernel, ...]
     inherit_session: bool
     timeout_s: float | None
 
@@ -336,16 +353,33 @@ class Kernel:
     def qualified_name(self) -> str: ...   # "api/implement"
 ```
 
-**依存**
-
 - `timeout_s` は `Graph.session_timeout_s` をこの Kernel だけ上書きする。`None` なら Graph の値。
 - Kernel 名は同じ Stream 内で一意。`"stream/kernel"` は Graph 内で一意。
-- `Kernel` オブジェクト、または `"kernel"` / `"stream/kernel"` 文字列。
-- 存在しない Kernel は `ValidationError`。前方参照は不可。
-- 同一 Stream 内では宣言順に暗黙の依存辺が張られる。
-- 循環は `validate()` で検出する。
+- Kernel に `depends_on` / 依存フィールドは無い。順序は Stream 内の宣言順と event wait から決まる。
+- `inherit_session=True` は同じ Stream の直前 Kernel がある場合だけ有効。
+- 依存関係は `validate()` で検査し、循環も検出する。
 
-### 5.6 `Execution`
+### 5.6 `Event`
+
+```python
+@dataclass(frozen=True)
+class Event:
+    graph: Graph
+    stream: Stream
+    name: str
+    after: Kernel | None       # record 時点の Stream 末尾。空なら None
+
+    @property
+    def qualified_name(self) -> str: ...   # "api/design_done"
+```
+
+- `record_event()` が返す graph-wide なハンドル。名前は Graph 内で一意。
+- `after` は record した時点でその Stream に宣言されていた最後の Kernel。event はその Kernel の成功で完了する。
+- record 後に同じ Stream へ追加した Kernel は event に含まれない。
+- 複数の Stream が同じ event を wait できる。
+- event は 1 回だけ record する。再 record は `ValidationError`。
+
+### 5.7 `Execution`
 
 ```python
 class Execution:
@@ -356,19 +390,26 @@ class Execution:
     run_dir: Path
 
     def wait(self, timeout_s: float | None = None) -> Execution: ...
+    def synchronize(self) -> Execution: ...
+    def query(self) -> bool: ...
+    def wait_stream(self, stream: Stream | str, timeout_s: float | None = None) -> Execution: ...
+    def query_stream(self, stream: Stream | str) -> bool: ...
     def cancel(self, *, grace_s: float = 10.0) -> None: ...
 
     @property
     def kernels(self) -> Mapping[str, KernelResult]: ...
 ```
 
-- `wait()` は終端までブロック。`timeout_s` は待ち時間の上限で、run は止めない。超過時は `HerdaTimeoutError`。
+- `wait()` / `synchronize()` は終端までブロック。CUDA の device synchronize に相当。`timeout_s` は待ち時間の上限で、run は止めない。超過時は `HerdaTimeoutError`。
+- `query()` は run 全体が終端かどうかを返す。
+- `wait_stream(stream)` は指定 Stream の全 Kernel が終端になるまで待つ。CUDA の stream synchronize に相当し、run 全体は止めない。
+- `query_stream(stream)` は指定 Stream の全 Kernel が終端かどうかを返す。
 - `cancel()` は新規スケジュールを止め、実行中 Session を `interrupt` → grace 後に `kill` → `hc rm` し、`RunState.canceled` にする。実行中は `KernelState.canceled`、未実行は `skipped`（`error.code="canceled"`）。worktree は残し、lock は解放する。
 - `kernels` のキーは `"stream/kernel"`。
 
 **注意**: `start()` はプロセス内のバックグラウンド実行。Python プロセスが終了すると DAG も止まる。herdr terminal は生き残るが、v0.1 に resume は無い（§13）。
 
-### 5.7 結果型
+### 5.8 結果型
 
 日時は UTC aware。永続化時は ISO 8601（`Z`）。
 
@@ -409,14 +450,18 @@ class KernelResult:
 
 - ノード = Kernel。
 - 辺 = 依存。`A -> B` は A 成功後に B 開始。
-- 同一 Stream 内は宣言順に暗黙辺 `k1 -> k2 -> k3`。
-- Stream 間の辺は `depends_on` で明示。
+- 同一 Stream 内は宣言順に暗黙辺 `k1 -> k2 -> k3`。Kernel に依存指定は無い。
+- Stream 間の辺は event で作る。Stream A が `record_event` した時点の末尾 Kernel から、Stream B の `wait_event` 後の最初の Kernel へ辺が張られる。
+- `wait_event` は次の 1 Kernel だけに効く。その後は Stream B 内の直列辺で順序が伝播する。
 - DAG でなければならない。
 
 ```
 stream api:   design ──> implement ──> test
                  │
-stream web:      └────> ui
+                 │ record design_done
+                 ▼
+stream web:      ui
+                 （wait_event(design_done) してから ui）
 ```
 
 ### 6.2 実行規則
@@ -448,7 +493,7 @@ flowchart LR
 
 - Stream は `subgraph`。
 - ノードは Kernel 名 + モデル。
-- Stream 内の暗黙辺は点線、Stream 間の明示依存は実線。
+- Stream 内の暗黙辺は点線、event wait による Stream 間の辺は実線。
 - `to_mermaid()` は静的な DAG。ライブ状態は herdr app で見る。
 
 ---
@@ -842,15 +887,17 @@ API の誤用・preflight 失敗だけが例外になる。すべて `HerdaError
 
 ### 12.1 単体（fake backend）
 
-1. Graph / Stream / Kernel の `name` 必須。
+1. Graph / Stream / Kernel / Event の `name` 必須。
 2. `.md` 以外、存在しない、空の prompt は `PromptError`。
-3. DAG 循環、前方参照、空 Stream を検出。
-4. 同一 Stream の暗黙辺と `depends_on` の dedupe。
-5. `inherit_session=True` で直前 Kernel が無いなら `ValidationError`。直前が失敗した場合は下流が `skipped` になる。
-6. 依存失敗で下流が `skipped`、無関係な Stream は完走。
-7. `cancel()` で running / pending が正しい状態になる。
-8. `to_mermaid()` のスナップショット。
-9. `cleanup(worktrees=True)` が dirty worktree を拒否する。
+3. DAG 循環、空 Stream を検出。
+4. Stream 内の暗黙辺と event wait / wait_stream の dedupe。
+5. `wait_event` が次の 1 Kernel だけに効き、同じ Stream の event は no-op。
+6. `wait_stream` が呼び出し時点の末尾だけを待つ。
+7. `inherit_session=True` で直前 Kernel が無いなら `ValidationError`。直前が失敗した場合は下流が `skipped` になる。
+8. event の元 Kernel が失敗したとき、wait した Stream の下流が `skipped`、無関係な Stream は完走。
+9. `cancel()` / `Execution.wait_stream()` / `query_stream()` が正しい状態になる。
+10. `to_mermaid()` のスナップショット。
+11. `cleanup(worktrees=True)` が dirty worktree を拒否する。
 
 ### 12.2 統合（実 herdr-core + opencode）
 
