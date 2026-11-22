@@ -205,7 +205,7 @@ class DoctorHelperTests(unittest.TestCase):
             side_effect=[
                 (False, ""),
                 (True, "hc 1"),
-                (True, "opencode 1"),
+                (True, "pi 1"),
                 (False, "missing"),
             ],
         ), mock.patch(

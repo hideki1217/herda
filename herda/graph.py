@@ -64,7 +64,7 @@ class Graph:
             raise ValidationError(
                 "model_required",
                 "Graph.default_model must not be empty",
-                "use opencode's provider/model form, e.g. "
+                "use pi's provider/model form, e.g. "
                 "anthropic/claude-sonnet-5-5",
             )
         if not isinstance(max_parallel, int) or max_parallel < 1:

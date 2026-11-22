@@ -39,15 +39,15 @@ class BackendHelperTests(unittest.TestCase):
 
 class BackendTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.backend = HcBackend(hc="hc", opencode="opencode")
+        self.backend = HcBackend(hc="hc", pi="pi")
 
     def test_env_overrides_and_subclass(self) -> None:
         with mock.patch.dict(
-            os.environ, {"HERDA_HC": "myhc", "HERDA_OPENCODE": "myoc"}
+            os.environ, {"HERDA_HC": "myhc", "HERDA_PI": "mypi"}
         ):
             backend = HcBackend()
             self.assertEqual(backend.hc, "myhc")
-            self.assertEqual(backend.opencode, "myoc")
+            self.assertEqual(backend.pi, "mypi")
         self.assertIsInstance(MissingDependencyBackend(), HcBackend)
         self.assertIsInstance(SendOutcome(True, "idle", 1), SendOutcome)
         self.assertIsInstance(
@@ -122,53 +122,28 @@ class BackendTests(unittest.TestCase):
             self.backend.preflight()
         self.assertIsNone(self.backend._hc_version)
 
-    def test_launch_argv_flag_detection(self) -> None:
-        with mock.patch(
-            "herda.backend.subprocess.run",
-            return_value=proc(0, out="FLAGS\n  --model string"),
-        ):
-            argv, env = self.backend.launch_argv(
-                "provider/model", inherit_session=True
-            )
+    def test_launch_argv(self) -> None:
+        argv, env = self.backend.launch_argv(
+            "provider/model", inherit_session=True
+        )
         self.assertEqual(
-            argv, ["opencode", "--model", "provider/model", "--continue"]
+            argv,
+            [
+                "pi",
+                "--no-approve",
+                "--model",
+                "provider/model",
+                "--continue",
+            ],
         )
         self.assertEqual(env, {})
 
-        backend = HcBackend(hc="hc", opencode="opencode")
-        with mock.patch(
-            "herda.backend.subprocess.run", side_effect=OSError("nope")
-        ):
-            argv, env = backend.launch_argv("p/m", inherit_session=False)
-        self.assertEqual(argv, ["opencode", "--model", "p/m"])
+        backend = HcBackend(hc="hc", pi="/custom/pi")
+        argv, env = backend.launch_argv("p/m", inherit_session=False)
+        self.assertEqual(
+            argv, ["/custom/pi", "--no-approve", "--model", "p/m"]
+        )
         self.assertEqual(env, {})
-
-    def test_launch_argv_config_fallback(self) -> None:
-        self.backend._opencode_model_flag = False
-        with mock.patch.dict(
-            os.environ, {"OPENCODE_CONFIG_CONTENT": '{"theme":"dark"}'}
-        ):
-            argv, env = self.backend.launch_argv("p/m", inherit_session=False)
-        self.assertEqual(argv, ["opencode"])
-        self.assertEqual(
-            json.loads(env["OPENCODE_CONFIG_CONTENT"]),
-            {"theme": "dark", "model": "p/m"},
-        )
-        with mock.patch.dict(
-            os.environ, {"OPENCODE_CONFIG_CONTENT": "not-json"}
-        ):
-            with self.assertLogs("herda", level="WARNING"):
-                _, env = self.backend.launch_argv("p/m", inherit_session=False)
-        self.assertEqual(
-            json.loads(env["OPENCODE_CONFIG_CONTENT"]), {"model": "p/m"}
-        )
-        with mock.patch.dict(
-            os.environ, {"OPENCODE_CONFIG_CONTENT": "[]"}
-        ):
-            _, env = self.backend.launch_argv("p/m", inherit_session=False)
-        self.assertEqual(
-            json.loads(env["OPENCODE_CONFIG_CONTENT"]), {"model": "p/m"}
-        )
 
     def test_run(self) -> None:
         with mock.patch(
@@ -177,7 +152,7 @@ class BackendTests(unittest.TestCase):
         ) as run:
             address = self.backend.run(
                 worktree=Path("/w"),
-                argv=["opencode"],
+                argv=["pi"],
                 env={"A": "B"},
                 name="n",
                 labels={"l": "v"},

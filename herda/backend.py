@@ -118,15 +118,12 @@ class HcBackend:
         self,
         *,
         hc: str | None = None,
-        opencode: str | None = None,
+        pi: str | None = None,
     ) -> None:
         self.hc = hc or os.environ.get("HERDA_HC") or "hc"
-        self.opencode = (
-            opencode or os.environ.get("HERDA_OPENCODE") or "opencode"
-        )
+        self.pi = pi or os.environ.get("HERDA_PI") or "pi"
         self.hc_path: str | None = None
-        self.opencode_path: str | None = None
-        self._opencode_model_flag: bool | None = None
+        self.pi_path: str | None = None
 
     # -- process helpers -------------------------------------------------
 
@@ -183,10 +180,10 @@ class HcBackend:
             missing.append(
                 "hc (herdr-core): install it and put 'hc' on PATH"
             )
-        self.opencode_path = shutil.which(self.opencode)
-        if self.opencode_path is None:
+        self.pi_path = shutil.which(self.pi)
+        if self.pi_path is None:
             missing.append(
-                "opencode: install OpenCode 2.2+ and put 'opencode' on PATH"
+                "pi: install Pi and put 'pi' on PATH (https://pi.dev)"
             )
 
         if missing:
@@ -223,58 +220,24 @@ class HcBackend:
     def launch_argv(
         self, model: str, *, inherit_session: bool
     ) -> tuple[list[str], dict[str, str]]:
-        """Return the opencode argv and any extra environment.
+        """Return the pi argv and any extra environment.
 
-        OpenCode 2.2/2.3 accepts ``--model`` before the TUI, while newer
-        builds moved model selection to configuration. Prefer the documented
-        flag and fall back to ``OPENCODE_CONFIG_CONTENT`` so a graph always
-        runs the model it declares.
+        Pi accepts ``provider/model`` directly with ``--model``. Project-local
+        Pi resources are ignored by default so a fresh herda worktree cannot
+        stop at a project-trust prompt; repository context files such as
+        ``AGENTS.md`` are still loaded by Pi. ``--continue`` resumes the
+        previous kernel's session in the same worktree.
         """
 
-        if self._opencode_model_flag is None:
-            executable = self.opencode_path or self.opencode
-            try:
-                proc = subprocess.run(
-                    [executable, "--help"],
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=15,
-                )
-                help_text = (proc.stdout or "") + (proc.stderr or "")
-                self._opencode_model_flag = "--model" in help_text
-            except (OSError, subprocess.TimeoutExpired):
-                self._opencode_model_flag = True
-
-        argv = [self.opencode_path or self.opencode]
-        env: dict[str, str] = {}
-        if self._opencode_model_flag:
-            argv.extend(["--model", model])
-        else:
-            config: dict[str, Any] = {}
-            raw = os.environ.get("OPENCODE_CONFIG_CONTENT")
-            if raw:
-                try:
-                    parsed = json.loads(raw)
-                    if isinstance(parsed, dict):
-                        config.update(parsed)
-                except json.JSONDecodeError:
-                    log.warning(
-                        "OPENCODE_CONFIG_CONTENT is not valid JSON; herda "
-                        "will replace it to select the kernel model"
-                    )
-            config["model"] = model
-            env["OPENCODE_CONFIG_CONTENT"] = json.dumps(
-                config, ensure_ascii=False, separators=(",", ":")
-            )
-            log.info(
-                "opencode has no top-level --model flag; selecting %s via "
-                "OPENCODE_CONFIG_CONTENT",
-                model,
-            )
+        argv = [
+            self.pi_path or self.pi,
+            "--no-approve",
+            "--model",
+            model,
+        ]
         if inherit_session:
             argv.append("--continue")
-        return argv, env
+        return argv, {}
 
     def run(
         self,

@@ -5,7 +5,7 @@
 - Runtime: Python 3.11+
 - Built on: [`herdr-core`](https://herdr.dev/core/) (`hc`) protocol generation 1
 - Observability: [`herdr app`](https://herdr.dev/)
-- Verified with: `hc` 0.1.21, OpenCode 2.3.2
+- Verified with: `hc` 0.1.21, Pi 1.6.0
 - Date: 2026-11-22
 
 **目次**: [1. 目的](#1-目的) / [2. 用語](#2-用語) / [3. 設計原則](#3-設計原則) / [4. クイックスタート](#4-クイックスタート) / [5. 公開 API](#5-公開-api) / [6. DAG](#6-dag) / [7. 実行セマンティクス](#7-実行セマンティクス) / [8. herdr 連携](#8-herdr-連携) / [9. CLI](#9-cli) / [10. エラー](#10-エラー) / [11. セキュリティ](#11-セキュリティ) / [12. テスト](#12-テスト) / [13. v0.1 の範囲](#13-v01-の範囲)
@@ -14,14 +14,14 @@
 
 ## 1. 目的
 
-**git worktree を CUDA の stream のように扱い、opencode の 1 prompt 実行を kernel として DAG に組む Python ライブラリ。**
+**git worktree を CUDA の stream のように扱い、pi の 1 prompt 実行を kernel として DAG に組む Python ライブラリ。**
 
 ```
 Python (herda)
   └─ DAG scheduler
-       ├─ worktree A ── herdr terminal ── opencode (prompt A1 → A2 → ...)
-       ├─ worktree B ── herdr terminal ── opencode (prompt B1)
-       └─ worktree C ── herdr terminal ── opencode (prompt C1)
+       ├─ worktree A ── herdr terminal ── pi (prompt A1 → A2 → ...)
+       ├─ worktree B ── herdr terminal ── pi (prompt B1)
+       └─ worktree C ── herdr terminal ── pi (prompt C1)
                             ▲
                             │ 同じ herdr-core
                        herdr app で全実行中セッションを閲覧
@@ -33,7 +33,7 @@ Python (herda)
 - Stream ごとに Kernel（= 1 herdr セッション = 1 prompt 実行）を順番に実行する
 - Kernel 間の依存から DAG を組み、依存が満たされた Kernel を並列実行する
 - worktree の作成・破棄を行う
-- herdr terminal 上で opencode を起動し、モデルと prompt を渡す
+- herdr terminal 上で pi を起動し、モデルと prompt を渡す
 - OSC 7501 の `idle` / `working` / `blocked` / `done` / `error` で完了を検知する
 - 完了後にセッションを閉じ、次の Kernel を新しいセッションとして開始する
 - 実行中のセッションを herdr app から見える状態に保つ
@@ -48,7 +48,7 @@ Python (herda)
 - 複数リポジトリをまたぐ DAG
 - host からリモート machine の worktree を操作すること（herda は core と同じマシンで動かす。§8.3）
 - stream 間の自動マージ／ファイル転送
-- 特定の過去 opencode session への復帰
+- 特定の過去 pi session への復帰
 - engine 死亡後の run 再開（§13）
 - Kernel の retry（§13）
 - result file による成功判定（§13）
@@ -81,9 +81,9 @@ Python (herda)
 
 | レイヤ | 責務 |
 |---|---|
-| **herda** | DAG、worktree、opencode 起動、モデル指定、prompt 投入、完了検知、セッションのリセット／引き継ぎ |
+| **herda** | DAG、worktree、pi 起動、モデル指定、prompt 投入、完了検知、セッションのリセット／引き継ぎ |
 | **herdr-core (`hc`)** | terminal の保持、attach/read/send/wait、OSC 7501、labels、イベント |
-| **opencode** | コーディング、OSC 7501 の報告、会話履歴 |
+| **pi** | コーディング、OSC 7501 の報告、会話履歴 |
 | **herdr app** | 実行中 terminal の一覧・attach・承認 |
 
 > herda は `hc` を Python からラップする。独自の PTY やデーモンは持たない。
@@ -125,7 +125,7 @@ Python (herda)
 - Linux / macOS
 - `git` 2.30+
 - `hc` がインストールされ、`hc server status` が動く
-- `opencode` 2.2.0+（OSC 7501 対応）
+- `pi` 1.6+（OSC 7501 対応）
 - `herdr app`（表示に使う場合は起動しておく）
 - Python 3.11+
 
@@ -134,7 +134,7 @@ pip install herda
 herda doctor
 ```
 
-`herda doctor` は `git`、`hc`、`opencode` のバージョン、OSC 7501 の観測（`--deep`）、`herdr-app` の有無（`--app`）を確認する。
+`herda doctor` は `git`、`hc`、`pi` のバージョン、OSC 7501 の観測（`--deep`）、`herdr-app` の有無（`--app`）を確認する。
 
 ### 4.2 最小の DAG
 
@@ -183,7 +183,7 @@ api.kernel(
 )
 ```
 
-`inherit_session=True` は、同じ Stream の直前 Kernel が成功した場合だけ `opencode --continue` で会話を引き継ぐ。
+`inherit_session=True` は、同じ Stream の直前 Kernel が成功した場合だけ `pi --no-approve --continue` で会話を引き継ぐ。
 
 ### 4.4 状態を見る
 
@@ -529,9 +529,9 @@ starting ── idle ──> ready ── send ──> sending ── working �
 - 1 Session = 1 herdr terminal。
 - 完了／失敗確定後:
   1. screen を `screen.txt` に保存
-  2. `hc kill` で opencode を終了
+  2. `hc kill` で pi を終了
   3. `hc rm` で terminal を除去
-- これが「セッションのリセット」。同じ worktree に idle の opencode を残さない。
+- これが「セッションのリセット」。同じ worktree に idle の pi を残さない。
 - 次 Kernel は新しい terminal / 新しいプロセスで始まる。
 - `blocked` 待機中だけはプロセスを生かす。人間が herdr app で承認／回答する。
 
@@ -549,20 +549,21 @@ starting ── idle ──> ready ── send ──> sending ── working �
 ### 7.4 モデル
 
 - Kernel の `model` があればそれを使う。無ければ `Graph.default_model`。
-- 形式は opencode の `provider/model`（例: `anthropic/claude-sonnet-5-5`）。
-- 空なら `ValidationError`。`opencode models` との照合は `herda doctor` で任意に行う。
+- 形式は pi の `provider/model`（例: `anthropic/claude-sonnet-5-5`）。
+- 空なら `ValidationError`。`pi --list-models` との照合は `herda doctor` で任意に行う。
 
 ### 7.5 セッション引き継ぎ
 
 既定は **引き継がない**。
 
-- `inherit_session=False`: 新しい opencode プロセス。worktree のファイルは前 Kernel のまま。会話は含まない。
+- 起動時は常に `pi --no-approve` を渡す。worktree の project-local Pi settings / extensions は読み込まず、trust dialog で kernel が止まらないようにする。`AGENTS.md` などの context file は Pi が読み込む。
+- `inherit_session=False`: 新しい pi プロセス。worktree のファイルは前 Kernel のまま。会話は含まない。
 - `inherit_session=True`:
   - 同じ run・同じ Stream の **直前 Kernel** が `succeeded` のときだけ有効。
-  - 実装は `opencode --continue` のみ。session id は記録しない。
+  - 実装は `pi --continue` のみ。session id は記録しない。
   - 直前 Kernel が無い（最初の Kernel）場合は `ValidationError`。失敗した Kernel の下流は skip されるため、引き継ぎは実行されない。
   - 任意の過去 session に戻る機能は無い。
-- `--continue` は worktree 内の最後の opencode セッションを選ぶ。同じ worktree で手動 opencode を動かすと誤った会話を拾うため、`inherit_session=True` の worktree では手動起動しないこと。
+- `--continue` は worktree 内の最後の pi セッションを選ぶ。同じ worktree で手動 pi を動かすと誤った会話を拾うため、`inherit_session=True` の worktree では手動起動しないこと。
 
 ### 7.6 完了検知
 
@@ -591,7 +592,7 @@ herdr-core の OSC 7501 だけを使う。
 - prompt 投入後の `blocked` は `session_timeout_s` がある場合だけ打ち切る。無ければユーザーが cancel するまで待つ。起動時の `blocked`（trust dialog など）は `session_timeout_s` の対象外で、ユーザーが解決するか cancel するまで待つ。
 - `restarted` / `lost` は失敗（`session_lost`）。herdr app の adoption で `keep` が有効になり代替シェルが起動した場合は、そのシェルを kill する。
 
-> 確認済み: OpenCode 2.3.2 を herdr-core 0.1.21 の terminal で起動すると、`hc get` に `{"app":"opencode","state":"idle"}` が現れる。OpenCode 2.2.0+ は TUI から OSC 7501 を報告する。
+> 確認済み: Pi 1.6.0 を herdr-core 0.1.21 の terminal で起動すると、`hc get` に `{"app":"pi","state":"idle"}` が現れる。Pi 1.6+ は TUI から OSC 7501 を報告する。
 
 ### 7.7 ファイル配置と lock
 
@@ -651,13 +652,13 @@ hc run --bg --json --no-parent --no-notify \
     HERDA_WORKTREE=/repo/.herda/worktrees/auth-refactor/20261122T051500Z-a1b2c3/api \
     HERDA_BRANCH=herda/auth-refactor/api-a1b2c3 \
     HERDA_BRANCHES='{"api":"herda/auth-refactor/api-a1b2c3","web":"herda/auth-refactor/web-a1b2c3"}' \
-    opencode --model anthropic/claude-sonnet-5-5
+    pi --no-approve --model anthropic/claude-sonnet-5-5
 ```
 
 - `hc run` に `--env` は無いため、POSIX の `env` を argv 先頭に置く。
 - `--no-parent` / `--no-notify` で herdr の自動 note を抑止する。
 - `--keep` は付けない。app の adoption で keep が有効になる場合があるため、`restarted` を失敗として扱う。
-- 引き継ぎ時は `opencode --model <model> --continue`。
+- 引き継ぎ時は `pi --no-approve --model <model> --continue`。
 
 その他のコマンド:
 
@@ -738,7 +739,7 @@ herdr-core を SSH 先の devcontainer で動かし、herdr app をホストで�
                                  herdr-core (hc)
                                  herda (Python)
                                  git worktrees
-                                 opencode
+                                 pi
 ```
 
 - **herda は core と同じ devcontainer 内で動かす。** herda から見れば local core なので、v0.1 の「worktree は local」制約を満たす。
@@ -877,7 +878,7 @@ API の誤用・preflight 失敗だけが例外になる。すべて `HerdaError
 - prompt はエージェントに実行されるコード。信頼できる入力だけを渡す。
 - herda は worktree の外のファイルを削除しない。`git clean` / `git reset --hard` を使わない。
 - 未コミット変更のある worktree は `force=True` なしで削除しない。
-- `hc send --force` / `opencode --auto` を既定で使わない。承認を自動化しない。
+- `hc send --force` は使わない。Pi は `--no-approve` で project-local resources を読み込まず、trust dialog を自動承認しない。
 - `.herda/` は git 管理外にし、可能なら 0700 にする。
 - prompt / screen には secret が入り得る。
 
@@ -899,15 +900,15 @@ API の誤用・preflight 失敗だけが例外になる。すべて `HerdaError
 10. `to_mermaid()` のスナップショット。
 11. `cleanup(worktrees=True)` が dirty worktree を拒否する。
 
-### 12.2 統合（実 herdr-core + opencode）
+### 12.2 統合（実 herdr-core + pi）
 
 1. 2 Stream / 3 Kernel の DAG が実行でき、Stream 内は直列、Stream 間は並列。
 2. 各時点で `hc ls --label herda.owner=herda` の active Session が Stream ごとに 1 以下。
 3. 既定 `inherit_session=False` で、2 番目の Kernel が 1 番目の会話を参照できない。
 4. `inherit_session=True` で参照できる。
 5. `blocked` を発生させ、herdr app で承認すると run が継続・完了する。
-6. opencode の OSC 7501 が turn 完了（`idle` / `done`）を示したときだけ成功になる。
-7. 完了後に opencode プロセスが kill され、terminal が `hc rm` される。
+6. pi の OSC 7501 が turn 完了（`idle` / `done`）を示したときだけ成功になる。
+7. 完了後に pi プロセスが kill され、terminal が `hc rm` される。
 8. 各 terminal に `herdr.space` / `herdr.tab` が付き、app 上で Graph 名の space / Stream 名の tab に入る。
 9. `session_timeout_s` で kill され、worktree と screen が残る。
 10. `hc` の `restarted` で `session_lost` の失敗になり、代替シェルが残らない。
@@ -922,14 +923,14 @@ API の誤用・preflight 失敗だけが例外になる。すべて `HerdaError
 |---|---|
 | agent の session id / `--session` | 今は特定の過去 Session に戻りたくない。`--continue` で足りる。 |
 | result file による成功判定 | OSC 7501 の `idle` はターン終了であって成功ではないが、v0.1 では DAG の成否は「turn 完了」で十分。必要になったら追加する。 |
-| headless / `opencode run` | herdr app で見る TUI が要件。 |
+| headless / `pi -p` | herdr app で見る TUI が要件。 |
 | Kernel の retry | 失敗は記録して止める。再実行は新しい run。 |
 | engine crash 後の resume | 実装が大きい。terminal は herdr が保持するので、v0.1 では手動で attach / clean する。 |
 | events API | ライブ表示は herdr app。Python 側は `wait()` と `kernels` で足りる。 |
 | prompt templating | 動的な値は `HERDA_BRANCHES` などの環境変数で渡す。 |
 | DOT / SVG 描画 | Mermaid で足りる。 |
 | 明示 branch / worktree / slug | 自動命名で足りる。 |
-| カスタム agent / env / labels | opencode 専用で十分。 |
+| カスタム agent / env / labels | pi 専用で十分。 |
 | herdr app の space/tab 手動指定 | 自動 ID + rename で足りる。 |
 | worktree の自動削除 | 成果を守る。明示 `cleanup` のみ。 |
 | branch の自動削除 | 成果を守る。git に任せる。 |
@@ -937,7 +938,7 @@ API の誤用・preflight 失敗だけが例外になる。すべて `HerdaError
 ### 13.2 既知の制限
 
 - engine が死ぬと DAG は止まる。herdr terminal は生き残るので `hc attach` で状態を見られるが、次の Kernel には進まない。残った terminal / worktree は `herda clean RUN_ID [--worktrees]` で片付ける。
-- `opencode --continue` は worktree 内の最後の会話を選ぶ。同じ worktree で手動 opencode を動かすと誤る。
+- `pi --continue` は worktree 内の最後の会話を選ぶ。同じ worktree で手動 pi を動かすと誤る。
 - herdr app の space/tab 名は、`herdr-app` CLI が使えないと既定名になる。
 - `blocked` は `session_timeout_s` が無ければユーザーが cancel するまで待つ。
 - 1 つの Graph は 1 つのリポジトリだけ。

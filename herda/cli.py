@@ -232,7 +232,7 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument(
         "--deep",
         action="store_true",
-        help="start opencode in a herdr terminal and observe OSC 7501",
+        help="start pi in a herdr terminal and observe OSC 7501",
     )
     doctor.add_argument(
         "--app",

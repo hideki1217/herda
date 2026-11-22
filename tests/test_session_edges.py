@@ -71,7 +71,7 @@ class ScriptedBackend:
 
     def _launch_argv(self, model: str, *, inherit_session: bool):
         self.launch_calls.append((model, inherit_session))
-        return ["opencode", "--from-launch"], {"EXTRA": "1"}
+        return ["pi", "--from-launch"], {"EXTRA": "1"}
 
     def preflight(self) -> None:
         return None
@@ -210,7 +210,7 @@ class SessionEdgeTests(RepoCase):
         outcome = runner.run()
         self.assertEqual(outcome.state, KernelState.succeeded)
         self.assertTrue(backend.launch_calls[0][1])
-        self.assertEqual(backend.run_calls[0]["argv"], ["opencode", "--from-launch"])
+        self.assertEqual(backend.run_calls[0]["argv"], ["pi", "--from-launch"])
         self.assertEqual(backend.run_calls[0]["env"]["EXTRA"], "1")
 
     def test_run_herdr_error(self) -> None:

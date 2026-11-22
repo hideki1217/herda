@@ -1,4 +1,4 @@
-"""One kernel session: start opencode, send one prompt, wait for OSC 7501.
+"""One kernel session: start pi, send one prompt, wait for OSC 7501.
 
 The state machine follows API.md §7.2 and §7.6. Nothing here scrapes the
 screen; only ``hc get`` status/turn fields decide whether a turn finished.
@@ -180,7 +180,7 @@ class SessionRunner:
             "HERDA_BRANCH": kernel.stream.branch or "",
             "HERDA_BRANCHES": _json_dumps(self.branches),
         }
-        argv = ["opencode", "--model", kernel.model]
+        argv = ["pi", "--no-approve", "--model", kernel.model]
         if kernel.inherit_session:
             argv.append("--continue")
         launch = getattr(self.backend, "launch_argv", None)

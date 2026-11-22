@@ -24,7 +24,7 @@ docs stream:        └─> design(docs/plan.md) -> readme <┘
 
 ```bash
 cd examples/hello_world
-HERDA_MODEL=fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash-1017 \
+HERDA_MODEL=fireworks/accounts/fireworks/models/deepseek-v4p1-flash-1017 \
   ./run.sh
 ```
 
@@ -32,7 +32,7 @@ HERDA_MODEL=fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash-1017 \
 `herda run graph.py` を実行します。モデルは `HERDA_MODEL` で指定してください
 （未指定時は `anthropic/claude-sonnet-5-5`）。
 
-`herda doctor` で `git` / `hc` / `opencode` を確認できます。
+`herda doctor` で `git` / `hc` / `pi` を確認できます。
 
 ## 結果を見る
 

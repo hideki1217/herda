@@ -2,7 +2,8 @@
 
 CUDA streams for coding agents: a DAG engine on top of
 [herdr-core](https://herdr.dev/core/), where each stream is a git worktree and
-each kernel is one herdr session (one prompt) running opencode.
+each kernel is one herdr session (one prompt) running
+[pi](https://pi.dev/).
 
 The API specification is in [API.md](./API.md).
 
@@ -73,20 +74,27 @@ before a run starts:
 
 - `git` 2.30+
 - `hc` (herdr-core) with a reachable core
-- `opencode` 2.2+
+- `pi` (the Pi coding agent) 1.6+
 
 If any of them is missing, `herda` logs which dependency is missing and stops
 before creating worktrees or terminals.
 
 ```bash
-herda doctor          # git / hc / core / opencode
-herda doctor --deep   # also start opencode and observe OSC 7501
+herda doctor          # git / hc / core / pi
+herda doctor --deep   # also start pi and observe OSC 7501
 herda doctor --app    # also check the optional herdr-app
 ```
 
-OpenCode 2.3 moved model selection out of the top-level `--model` flag. herda
-uses `--model` when the installed opencode supports it, and otherwise passes
-the kernel model through `OPENCODE_CONFIG_CONTENT`.
+herda launches pi as `pi --no-approve --model <provider/model>`. Pi's
+`--model` accepts the same `provider/model` form used by `Graph.default_model`
+and kernel `model=...`. Use `pi --list-models` to find a model id for
+your provider. With `inherit_session=True`, herda adds `--continue`
+so pi resumes the previous kernel's session in the same worktree.
+
+`--no-approve` keeps project-local Pi settings and extensions from triggering
+an interactive trust prompt in a fresh worktree. Repository context files such
+as `AGENTS.md` are still loaded. Override the pi executable with `HERDA_PI` if
+it is not on `PATH`.
 
 ## Examples
 

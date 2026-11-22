@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
@@ -72,12 +73,17 @@ def _hc_status() -> tuple[bool, str]:
     return True, f"core {version} (pid {pid})"
 
 
+def _pi_command() -> str:
+    return os.environ.get("HERDA_PI") or "pi"
+
+
 def _deep_osc(timeout_s: float = 30.0) -> Check:
-    if shutil.which("hc") is None or shutil.which("opencode") is None:
+    pi = _pi_command()
+    if shutil.which("hc") is None or shutil.which(pi) is None:
         return Check(
             "OSC 7501 (deep)",
             False,
-            "skipped: hc or opencode is missing",
+            "skipped: hc or pi is missing",
         )
     backend = HcBackend()
     temp = Path(tempfile.mkdtemp(prefix="herda-doctor-"))
@@ -86,7 +92,7 @@ def _deep_osc(timeout_s: float = 30.0) -> Check:
         name = f"herda-doctor-{int(time.time()) % 100000}"
         terminal = backend.run(
             worktree=temp,
-            argv=["opencode"],
+            argv=[pi, "--no-session", "--no-approve"],
             env={},
             name=name,
             labels={"herda.owner": "herda-doctor"},
@@ -99,7 +105,7 @@ def _deep_osc(timeout_s: float = 30.0) -> Check:
                 return Check(
                     "OSC 7501 (deep)",
                     False,
-                    f"opencode exited before reporting (reason={info.reason})",
+                    f"pi exited before reporting (reason={info.reason})",
                 )
             if info.reported:
                 seen = info.status
@@ -114,7 +120,7 @@ def _deep_osc(timeout_s: float = 30.0) -> Check:
             return Check(
                 "OSC 7501 (deep)",
                 False,
-                "no status report observed; use OpenCode 2.2+",
+                "no status report observed; use Pi 1.6+",
             )
         return Check(
             "OSC 7501 (deep)",
@@ -149,8 +155,9 @@ def run_doctor(*, deep: bool = False, app_check: bool = False) -> list[Check]:
         core_ok, core_detail = _hc_status()
         checks.append(Check("herdr-core", core_ok, core_detail))
 
-    oc_ok, oc_detail = _which_version("opencode", "--version")
-    checks.append(Check("opencode", oc_ok, oc_detail))
+    pi = _pi_command()
+    pi_ok, pi_detail = _which_version(pi, "--version")
+    checks.append(Check("pi", pi_ok, pi_detail))
 
     if deep:
         checks.append(_deep_osc())

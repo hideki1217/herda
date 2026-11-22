@@ -519,7 +519,7 @@ class CliTests(RepoCase):
 
 
 class PreflightTests(RepoCase):
-    def test_missing_hc_and_opencode_stop_before_worktrees(self) -> None:
+    def test_missing_hc_and_pi_stop_before_worktrees(self) -> None:
         graph = Graph(
             "auth",
             self.repo,
@@ -532,7 +532,7 @@ class PreflightTests(RepoCase):
             os.environ,
             {
                 "HERDA_HC": os.path.join(missing, "hc"),
-                "HERDA_OPENCODE": os.path.join(missing, "opencode"),
+                "HERDA_PI": os.path.join(missing, "pi"),
             },
         ):
             with self.assertLogs("herda", level="ERROR"):
@@ -549,7 +549,7 @@ class PreflightTests(RepoCase):
             os.environ,
             {
                 "HERDA_HC": os.path.join(missing, "hc"),
-                "HERDA_OPENCODE": os.path.join(missing, "opencode"),
+                "HERDA_PI": os.path.join(missing, "pi"),
             },
         ):
             with self.assertLogs("herda", level="ERROR") as logs:
@@ -558,33 +558,32 @@ class PreflightTests(RepoCase):
         self.assertEqual(caught.exception.code, "missing_dependency")
         text = "\n".join(logs.output)
         self.assertIn("hc", text)
-        self.assertIn("opencode", text)
+        self.assertIn("pi", text)
 
-    def test_opencode_model_flag_and_config_fallback(self) -> None:
+    def test_pi_model_argv(self) -> None:
         backend = HcBackend()
-        backend._opencode_model_flag = True
         argv, env = backend.launch_argv(
             "provider/model", inherit_session=True
         )
         self.assertEqual(
-            argv, ["opencode", "--model", "provider/model", "--continue"]
+            argv,
+            [
+                "pi",
+                "--no-approve",
+                "--model",
+                "provider/model",
+                "--continue",
+            ],
         )
         self.assertEqual(env, {})
 
-        backend = HcBackend()
-        backend._opencode_model_flag = False
-        with mock.patch.dict(
-            os.environ,
-            {"OPENCODE_CONFIG_CONTENT": '{"theme":"dark"}'},
-        ):
-            argv, env = backend.launch_argv(
-                "provider/model", inherit_session=False
-            )
-        self.assertEqual(argv, ["opencode"])
-        self.assertEqual(
-            json.loads(env["OPENCODE_CONFIG_CONTENT"]),
-            {"theme": "dark", "model": "provider/model"},
+        argv, env = backend.launch_argv(
+            "provider/model", inherit_session=False
         )
+        self.assertEqual(
+            argv, ["pi", "--no-approve", "--model", "provider/model"]
+        )
+        self.assertEqual(env, {})
 
     def test_concurrent_run_lock(self) -> None:
         graph = self.graph(_backend=FakeBackend(hang={"api/slow"}))
