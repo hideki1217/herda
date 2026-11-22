@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import json
+import math
 import os
 import subprocess
 import tempfile
@@ -46,8 +47,20 @@ from herda.store import (
     run_document,
 )
 from herda import worktree
+from herda.timeouts import validate_timeout
 
 from .test_herda import RepoCase
+
+
+class TimeoutTests(unittest.TestCase):
+    def test_validate_timeout(self) -> None:
+        self.assertIsNone(validate_timeout("x", None))
+        self.assertEqual(validate_timeout("x", 1), 1.0)
+        with self.assertRaises(ValidationError):
+            validate_timeout("x", None, allow_none=False)
+        for value in (0, -1, math.nan, math.inf, True, "1"):
+            with self.assertRaises(ValidationError):
+                validate_timeout("x", value)  # type: ignore[arg-type]
 
 
 class ErrorTests(unittest.TestCase):

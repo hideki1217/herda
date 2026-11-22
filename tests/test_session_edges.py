@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import unittest
+from unittest import mock
 from pathlib import Path
 from herda.backend import SendOutcome, TerminalInfo, WaitOutcome
 from herda.errors import HerdrError
@@ -69,7 +70,15 @@ class ScriptedBackend:
         else:
             self.launch_argv = None  # type: ignore[assignment]
 
-    def _launch_argv(self, model: str, *, inherit_session: bool):
+    def _launch_argv(
+        self,
+        model: str,
+        *,
+        inherit_session: bool,
+        session_dir=None,
+        extra_args=(),
+        env=None,
+    ):
         self.launch_calls.append((model, inherit_session))
         return ["pi", "--from-launch"], {"EXTRA": "1"}
 
@@ -137,10 +146,16 @@ class SessionEdgeTests(RepoCase):
         inherit: bool = False,
         session_timeout: float | None = None,
         ready_timeout: float = 0.15,
+        blocked_timeout: float | None = 3600.0,
+        status_timeout: float | None = 300.0,
         worktree: bool = True,
         large: Path | None = None,
     ):
-        graph = self.graph(_backend=backend)
+        graph = self.graph(
+            _backend=backend,
+            blocked_timeout_s=blocked_timeout,
+            status_timeout_s=status_timeout,
+        )
         stream = graph.stream("api", base="main")
         if inherit:
             stream.kernel("prev", self.prompt)
@@ -164,6 +179,8 @@ class SessionEdgeTests(RepoCase):
             cancel_event=threading.Event(),
             ready_timeout_s=ready_timeout,
             session_timeout_s=session_timeout,
+            blocked_timeout_s=graph.blocked_timeout_s,
+            status_timeout_s=graph.status_timeout_s,
             branches={"api": "branch"},
             prompt_text="prompt",
             prompt_sha256="sha",
@@ -234,6 +251,16 @@ class SessionEdgeTests(RepoCase):
         blocked = ScriptedBackend(gets=[info("blocked"), info("idle")])
         self.assertEqual(
             self.make_runner(blocked)[0].run().state, KernelState.succeeded
+        )
+
+        unblocked = ScriptedBackend(
+            gets=[info("blocked"), info("working"), info("idle")]
+        )
+        self.assertEqual(
+            self.make_runner(
+                unblocked, ready_timeout=5
+            )[0].run().state,
+            KernelState.succeeded,
         )
 
         working = ScriptedBackend(gets=[info("working"), info("working")])
@@ -374,6 +401,60 @@ class SessionEdgeTests(RepoCase):
             blocked_timeout, session_timeout=0.001
         )[0].run()
         self.assertEqual(outcome.error.code, "timeout")
+
+    def test_status_and_blocked_timeouts(self) -> None:
+        ready_status = ScriptedBackend(
+            gets=[info("working"), info(reported=False)]
+        )
+        self.assertEqual(
+            self.make_runner(
+                ready_status,
+                ready_timeout=5,
+                status_timeout=1e-9,
+            )[0].run().error.code,
+            "status_timeout",
+        )
+
+        ready_blocked = ScriptedBackend(
+            gets=[info("blocked"), info("blocked")]
+        )
+        self.assertEqual(
+            self.make_runner(
+                ready_blocked,
+                ready_timeout=5,
+                blocked_timeout=1e-9,
+                status_timeout=None,
+            )[0].run().error.code,
+            "blocked_timeout",
+        )
+
+        completion_status = ScriptedBackend(
+            gets=[
+                info("idle"),
+                info("working", turn=1),
+                info(reported=False),
+            ],
+            send_result=SendOutcome(
+                True, "working", 0, wait_outcome("working", 0, ended=False)
+            ),
+        )
+        self.assertEqual(
+            self.make_runner(
+                completion_status, status_timeout=1e-9
+            )[0].run().error.code,
+            "status_timeout",
+        )
+
+    def test_finalization_errors_do_not_skip_reaping(self) -> None:
+        backend = ScriptedBackend()
+        runner, _, _ = self.make_runner(backend)
+        with mock.patch.object(
+            runner.store, "write_screen", side_effect=OSError("disk")
+        ):
+            with self.assertLogs("herda", level="WARNING"):
+                outcome = runner.run()
+        self.assertEqual(outcome.state, KernelState.succeeded)
+        self.assertEqual(backend.killed, ["t1"])
 
     def test_get_errors_and_missing_terminal(self) -> None:
         not_found = ScriptedBackend(

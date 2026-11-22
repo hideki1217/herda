@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, Mapping
 from .backend import Backend
 from .errors import HerdaTimeoutError, ValidationError
 from .kernel import Kernel
-from .session import SessionRunner
+from .session import SessionOutcome, SessionRunner
 from .store import GraphLock, RunStore, kernel_document, run_document
 from .stream import Stream
 from .types import ErrorInfo, KernelResult, KernelState, RunState
@@ -69,6 +69,7 @@ class Execution:
         self._threads: list[threading.Thread] = []
         self._finished = False
         self._scheduler: threading.Thread | None = None
+        self._launch_cursor = 0
 
         self._results: dict[str, KernelResult] = {}
         for kernel in graph.kernels.values():
@@ -196,6 +197,7 @@ class Execution:
         ]
 
     def cancel(self, *, grace_s: float = 10.0) -> None:
+        grace_s = max(0.0, grace_s)
         with self._cond:
             if self._state in _TERMINAL_RUN_STATES:
                 return
@@ -262,8 +264,17 @@ class Execution:
 
         with self._cond:
             threads = list(self._threads)
+        deadline = time.monotonic() + max(10.0, grace_s)
         for thread in threads:
-            thread.join(timeout=10.0)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
+        alive = [thread.name for thread in threads if thread.is_alive()]
+        if alive:
+            log.warning(
+                "cancel left worker threads running: %s", ", ".join(alive)
+            )
 
         self._finalize()
 
@@ -303,7 +314,16 @@ class Execution:
                     capacity = self.graph.max_parallel - len(running)
                     busy_streams = {result.stream for result in running}
                     launches: list[Kernel] = []
-                    for kernel in self.graph.kernels.values():
+                    kernels = list(self.graph.kernels.values())
+                    start_index = (
+                        self._launch_cursor % len(kernels)
+                        if kernels
+                        else 0
+                    )
+                    ordered = (
+                        kernels[start_index:] + kernels[:start_index]
+                    )
+                    for offset, kernel in enumerate(ordered):
                         if capacity <= 0:
                             break
                         result = self._results[kernel.qualified_name]
@@ -319,6 +339,9 @@ class Execution:
                             launches.append(kernel)
                             capacity -= 1
                             busy_streams.add(kernel.stream.name)
+                            self._launch_cursor = (
+                                start_index + offset + 1
+                            ) % len(kernels)
 
                     if launches:
                         self._cond.notify_all()
@@ -370,8 +393,18 @@ class Execution:
         finally:
             with self._cond:
                 threads = list(self._threads)
+            deadline = time.monotonic() + 10.0
             for thread in threads:
-                thread.join()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                thread.join(timeout=remaining)
+            alive = [thread.name for thread in threads if thread.is_alive()]
+            if alive:
+                log.warning(
+                    "scheduler left worker threads running: %s",
+                    ", ".join(alive),
+                )
             self._finalize()
 
     def _propagate_skips_locked(self) -> None:
@@ -420,29 +453,73 @@ class Execution:
                     changed = True
 
     def _run_kernel(self, kernel: Kernel) -> None:
-        runner = SessionRunner(
-            kernel=kernel,
-            backend=self._backend,
-            store=self._store,
-            cancel_event=self._cancel_event,
-            ready_timeout_s=self.graph.ready_timeout_s,
-            session_timeout_s=(
-                kernel.timeout_s
-                if kernel.timeout_s is not None
-                else self.graph.session_timeout_s
-            ),
-            branches=self._branches,
-            prompt_text=self._prompt_texts[kernel.qualified_name],
-            prompt_sha256=self._prompt_shas[kernel.qualified_name],
-            large_prompt_path=self._large_prompts.get(kernel.qualified_name),
-            on_terminal=lambda terminal: self._on_terminal(kernel, terminal),
-            on_state=lambda state, status: self._on_state(
-                kernel, state, status
-            ),
-        )
-        outcome = runner.run()
+        runner: SessionRunner | None = None
+        try:
+            runner = SessionRunner(
+                kernel=kernel,
+                backend=self._backend,
+                store=self._store,
+                cancel_event=self._cancel_event,
+                ready_timeout_s=self.graph.ready_timeout_s,
+                session_timeout_s=(
+                    kernel.timeout_s
+                    if kernel.timeout_s is not None
+                    else self.graph.session_timeout_s
+                ),
+                blocked_timeout_s=self.graph.blocked_timeout_s,
+                status_timeout_s=self.graph.status_timeout_s,
+                branches=self._branches,
+                prompt_text=self._prompt_texts[kernel.qualified_name],
+                prompt_sha256=self._prompt_shas[kernel.qualified_name],
+                large_prompt_path=self._large_prompts.get(
+                    kernel.qualified_name
+                ),
+                on_terminal=lambda terminal: self._on_terminal(
+                    kernel, terminal
+                ),
+                on_state=lambda state, status: self._on_state(
+                    kernel, state, status
+                ),
+            )
+            outcome = runner.run()
+        except BaseException as exc:  # noqa: BLE001 - worker must terminate
+            log.exception("kernel worker crashed: %s", kernel.qualified_name)
+            terminal = runner.terminal if runner is not None else None
+            if terminal is not None:
+                for method in (
+                    getattr(self._backend, "kill", None),
+                    getattr(self._backend, "rm", None),
+                ):
+                    if method is not None:
+                        try:
+                            method(terminal)
+                        except Exception:  # noqa: BLE001 - best effort
+                            log.debug("terminal cleanup failed", exc_info=True)
+            now = _utcnow()
+            outcome = SessionOutcome(
+                state=KernelState.failed,
+                status=getattr(runner, "status", None),
+                terminal=terminal,
+                started_at=now,
+                finished_at=now,
+                duration_s=0.0,
+                output_path=None,
+                error=ErrorInfo(
+                    "internal", f"{type(exc).__name__}: {exc}"
+                ),
+            )
+
         with self._cond:
             result = self._results[kernel.qualified_name]
+            if (
+                self._cancel_event.is_set()
+                and result.state == KernelState.canceled
+            ):
+                outcome = replace(
+                    outcome,
+                    state=KernelState.canceled,
+                    error=ErrorInfo("canceled", "run was canceled"),
+                )
             self._results[kernel.qualified_name] = replace(
                 result,
                 state=outcome.state,
@@ -473,9 +550,12 @@ class Execution:
     ) -> None:
         with self._cond:
             result = self._results[kernel.qualified_name]
+            if result.state == state and result.status == status:
+                return
             self._results[kernel.qualified_name] = replace(
                 result, state=state, status=status
             )
+            self._persist_locked()
             self._cond.notify_all()
 
     # -- finalization ----------------------------------------------------
@@ -510,32 +590,35 @@ class Execution:
             self._persist_locked()
 
     def _persist_locked(self) -> None:
-        kernels = {
-            name: kernel_document(
-                result,
-                self._store.run_dir
-                / "prompts"
-                / result.stream
-                / f"{self.graph.kernels[name].name}.md",
-            )
-            for name, result in self._results.items()
-            if name in self.graph.kernels
-        }
-        document = run_document(
-            run_id=self.id,
-            graph_name=self.graph.name,
-            graph_slug=self.graph.slug,
-            repo=self.graph.repo,
-            state=self._state.value,
-            started_at=self.started_at,
-            finished_at=self.finished_at,
-            streams=self._streams,
-            kernels=kernels,
-            branches=self._branches,
-        )
         try:
+            kernels = {
+                name: kernel_document(
+                    result,
+                    self._store.run_dir
+                    / "prompts"
+                    / result.stream
+                    / f"{self.graph.kernels[name].name}.md",
+                )
+                for name, result in self._results.items()
+                if name in self.graph.kernels
+            }
+            agent = getattr(self._backend, "agent", None)
+            agent_name = getattr(agent, "name", None)
+            document = run_document(
+                run_id=self.id,
+                graph_name=self.graph.name,
+                graph_slug=self.graph.slug,
+                repo=self.graph.repo,
+                state=self._state.value,
+                started_at=self.started_at,
+                finished_at=self.finished_at,
+                streams=self._streams,
+                kernels=kernels,
+                branches=self._branches,
+                agent=agent_name,
+            )
             self._store.write_run(document)
-        except OSError as exc:
+        except Exception as exc:  # noqa: BLE001 - persistence is best effort
             log.error("could not write %s: %s", self._store.run_json, exc)
 
     def __repr__(self) -> str:

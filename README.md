@@ -96,6 +96,18 @@ an interactive trust prompt in a fresh worktree. Repository context files such
 as `AGENTS.md` are still loaded. Override the pi executable with `HERDA_PI` if
 it is not on `PATH`.
 
+Pi sessions are stored per run and stream under
+`.herda/runs/<run_id>/agent-sessions/<stream>/`, so `inherit_session=True`
+does not depend on Pi's global session history.
+
+## Operations
+
+```bash
+herda status [RUN_ID] [--json]       # inspect run.json
+herda clean RUN_ID --worktrees       # remove worktrees for a finished run
+herda clean RUN_ID --worktrees --branches  # also remove herda/* branches
+```
+
 ## Examples
 
 - [`examples/hello_world`](./examples/hello_world/): five prompts split across

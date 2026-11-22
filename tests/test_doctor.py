@@ -151,6 +151,17 @@ class DoctorHelperTests(unittest.TestCase):
         self.assertFalse(check.ok)
         self.assertIn("exited", check.detail)
 
+    def test_deep_osc_blocked_is_not_success(self) -> None:
+        backend = FakeDoctorBackend(
+            infos=[TerminalInfo("t1", "live", "blocked", 0, True)]
+        )
+        with mock.patch(
+            "herda.doctor.shutil.which", return_value="/bin/x"
+        ), mock.patch("herda.doctor.HcBackend", return_value=backend):
+            check = doctor._deep_osc()
+        self.assertFalse(check.ok)
+        self.assertIn("blocked", check.detail)
+
     def test_deep_osc_last_state_and_no_report(self) -> None:
         backend = FakeDoctorBackend(
             infos=[TerminalInfo("t1", "live", "working", 0, True)]

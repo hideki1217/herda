@@ -25,7 +25,7 @@ graph = Graph(
     WORKSPACE,
     default_model=MODEL,
     base_dir=HERE,
-    ready_timeout_s=180,       # open code can take a while on first start
+    ready_timeout_s=180,       # pi can take a while on first start
     session_timeout_s=600,     # one prompt turn, not the whole graph
 )
 

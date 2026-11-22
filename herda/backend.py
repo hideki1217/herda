@@ -13,8 +13,9 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Mapping, Protocol, Sequence
 
+from .agent import PiAgent
 from .errors import HerdrError
 
 log = logging.getLogger("herda")
@@ -56,6 +57,16 @@ class SendOutcome:
 
 class Backend(Protocol):
     def preflight(self) -> None: ...
+
+    def launch_argv(
+        self,
+        model: str,
+        *,
+        inherit_session: bool,
+        session_dir: Path | None = None,
+        extra_args: Sequence[str] = (),
+        env: Mapping[str, str] | None = None,
+    ) -> tuple[list[str], dict[str, str]]: ...
 
     def run(
         self,
@@ -119,9 +130,11 @@ class HcBackend:
         *,
         hc: str | None = None,
         pi: str | None = None,
+        agent: PiAgent | None = None,
     ) -> None:
         self.hc = hc or os.environ.get("HERDA_HC") or "hc"
-        self.pi = pi or os.environ.get("HERDA_PI") or "pi"
+        self.agent = agent or PiAgent(pi)
+        self.pi = self.agent.executable
         self.hc_path: str | None = None
         self.pi_path: str | None = None
 
@@ -180,11 +193,9 @@ class HcBackend:
             missing.append(
                 "hc (herdr-core): install it and put 'hc' on PATH"
             )
-        self.pi_path = shutil.which(self.pi)
+        self.pi_path = self.agent.resolve()
         if self.pi_path is None:
-            missing.append(
-                "pi: install Pi and put 'pi' on PATH (https://pi.dev)"
-            )
+            missing.append(self.agent.missing_hint)
 
         if missing:
             for item in missing:
@@ -218,26 +229,24 @@ class HcBackend:
     # -- terminal operations --------------------------------------------
 
     def launch_argv(
-        self, model: str, *, inherit_session: bool
+        self,
+        model: str,
+        *,
+        inherit_session: bool,
+        session_dir: Path | None = None,
+        extra_args: Sequence[str] = (),
+        env: Mapping[str, str] | None = None,
     ) -> tuple[list[str], dict[str, str]]:
-        """Return the pi argv and any extra environment.
+        """Delegate agent-specific argv construction to the adapter."""
 
-        Pi accepts ``provider/model`` directly with ``--model``. Project-local
-        Pi resources are ignored by default so a fresh herda worktree cannot
-        stop at a project-trust prompt; repository context files such as
-        ``AGENTS.md`` are still loaded by Pi. ``--continue`` resumes the
-        previous kernel's session in the same worktree.
-        """
-
-        argv = [
-            self.pi_path or self.pi,
-            "--no-approve",
-            "--model",
+        self.agent.path = self.pi_path or self.agent.path
+        return self.agent.launch_argv(
             model,
-        ]
-        if inherit_session:
-            argv.append("--continue")
-        return argv, {}
+            inherit_session=inherit_session,
+            session_dir=session_dir,
+            extra_args=extra_args,
+            env=env,
+        )
 
     def run(
         self,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from .store import (
     read_json,
 )
 from .worktree import (
+    delete_branch,
     prune_worktrees,
     remove_engine_dir,
     remove_worktree,
@@ -24,15 +26,40 @@ from .worktree import (
 
 log = logging.getLogger("herda")
 
+_RUN_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$")
+_GRAPH_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+
+def validate_run_id(run_id: str) -> str:
+    if not isinstance(run_id, str) or not _RUN_ID_RE.fullmatch(run_id):
+        raise CleanupError(
+            "invalid_run_id",
+            f"run_id {run_id!r} is not a valid herda run id",
+            "use the run id printed by 'herda run'",
+        )
+    return run_id
+
+
+def _validate_graph_slug(slug: Any) -> str:
+    text = str(slug or "")
+    if not _GRAPH_SLUG_RE.fullmatch(text):
+        raise CleanupError(
+            "invalid_run_json",
+            f"run.json has an invalid graph_slug: {text!r}",
+        )
+    return text
+
 
 def cleanup_run(
     repo: str | Path,
     run_id: str,
     *,
     worktrees: bool = False,
+    branches: bool = False,
     force: bool = False,
     backend: Any | None = None,
 ) -> None:
+    run_id = validate_run_id(run_id)
     root = require_git_repo(repo)
     herda_dir = root / ".herda"
     run_json = herda_dir / "runs" / run_id / "run.json"
@@ -49,38 +76,94 @@ def cleanup_run(
             "invalid_run_json",
             f"could not read {run_json}: {exc}",
         ) from exc
+    if not isinstance(document, dict):
+        raise CleanupError(
+            "invalid_run_json",
+            f"{run_json} must contain a JSON object",
+        )
 
-    graph_slug = str(document.get("graph_slug") or "")
+    if str(document.get("run_id") or "") != run_id:
+        raise CleanupError(
+            "run_mismatch",
+            f"run.json in {run_json} does not describe run {run_id!r}",
+        )
+
+    graph_slug = _validate_graph_slug(document.get("graph_slug"))
     lock_path = herda_dir / "locks" / f"{graph_slug}.lock"
     lock = acquire_cleanup_lock(lock_path)
     try:
+        kernels = document.get("kernels", {})
+        streams = document.get("streams", {})
+        if not isinstance(kernels, dict) or not isinstance(streams, dict):
+            raise CleanupError(
+                "invalid_run_json",
+                "run.json kernels/streams must be objects",
+            )
+        document["streams"] = streams
         terminals = [
             item.get("terminal")
-            for item in (document.get("kernels") or {}).values()
+            for item in kernels.values()
             if isinstance(item, dict) and item.get("terminal")
         ]
-        if terminals:
-            cleanup_terminals([str(item) for item in terminals], backend=backend)
+        terminals_ok = True
+        try:
+            cleanup_terminals(
+                [str(item) for item in terminals],
+                run_id=run_id,
+                backend=backend,
+            )
+        except Exception as exc:  # noqa: BLE001 - cleanup is best effort
+            # Worktree cleanup is still useful when the terminal backend is
+            # unavailable; keep the failure visible in the log.
+            terminals_ok = False
+            log.warning("could not clean terminals for %s: %s", run_id, exc)
 
         if worktrees:
-            cleanup_worktrees(document, repo=root, force=force)
+            cleanup_worktrees(
+                document,
+                repo=root,
+                force=force,
+                run_id=run_id,
+                graph_slug=graph_slug,
+            )
             prune_worktrees(root)
 
+        if branches:
+            _cleanup_branches(
+                document,
+                repo=root,
+                graph_slug=graph_slug,
+                run_id=run_id,
+            )
+
+        if terminals_ok:
+            for item in kernels.values():
+                if isinstance(item, dict):
+                    item["terminal"] = None
+        document["terminals_cleaned"] = terminals_ok
         document["cleaned_at"] = _now_iso()
         document["worktrees_removed"] = bool(worktrees)
+        document["branches_removed"] = bool(branches)
         try:
             atomic_write_json(run_json, document)
-        except OSError as exc:
+        except Exception as exc:  # noqa: BLE001 - best effort
             log.warning("could not update %s: %s", run_json, exc)
     finally:
         lock.release()
 
 
 def cleanup_terminals(
-    addresses: list[str], *, backend: Any | None = None
+    addresses: list[str],
+    *,
+    run_id: str | None = None,
+    backend: Any | None = None,
 ) -> None:
     if backend is None:
-        if shutil.which("hc") is None:
+        backend = HcBackend()
+        hc = getattr(backend, "hc", "hc")
+        if shutil.which(hc) is None:
+            if not addresses:
+                return
             message = "hc was not found in PATH; cannot clean up terminals"
             log.error("%s", message)
             raise HerdrError(
@@ -88,8 +171,23 @@ def cleanup_terminals(
                 message,
                 "install herdr-core or remove the worktrees without terminal cleanup",
             )
-        backend = HcBackend()
-    for address in dict.fromkeys(addresses):
+
+    candidates = list(dict.fromkeys(addresses))
+    if run_id:
+        lister = getattr(backend, "list", None)
+        if lister is not None:
+            try:
+                discovered = lister(
+                    labels={"herda.owner": "herda", "herda.run": run_id}
+                )
+            except HerdrError as exc:
+                log.debug("could not list terminals for %s: %s", run_id, exc)
+            else:
+                for info in discovered:
+                    if info.address not in candidates:
+                        candidates.append(info.address)
+
+    for address in candidates:
         try:
             info = backend.get(address)
         except HerdrError as exc:
@@ -97,6 +195,22 @@ def cleanup_terminals(
                 log.debug("terminal %s is already gone: %s", address, exc)
                 continue
             raise
+        labels = getattr(info, "labels", {}) or {}
+        if run_id is not None:
+            if labels.get("herda.owner") != "herda":
+                log.warning(
+                    "refusing to remove terminal %s: owner is not herda",
+                    address,
+                )
+                continue
+            if labels.get("herda.run") != run_id:
+                log.warning(
+                    "refusing to remove terminal %s: run label does not "
+                    "match %s",
+                    address,
+                    run_id,
+                )
+                continue
         try:
             if not info.finished:
                 backend.kill(address)
@@ -105,11 +219,58 @@ def cleanup_terminals(
             log.warning("could not remove terminal %s: %s", address, exc)
 
 
+def _cleanup_branches(
+    document: dict[str, Any],
+    *,
+    repo: Path,
+    graph_slug: str,
+    run_id: str,
+) -> None:
+    prefix = f"herda/{graph_slug}/"
+    suffix = f"-{run_id[-6:]}"
+    for name, info in (document.get("streams") or {}).items():
+        if not isinstance(info, dict):
+            continue
+        branch = str(info.get("branch") or "")
+        if not branch.startswith(prefix) or not branch.endswith(suffix):
+            if branch:
+                log.warning(
+                    "refusing to delete branch outside %s*%s: %s",
+                    prefix,
+                    suffix,
+                    branch,
+                )
+            continue
+        try:
+            proc = delete_branch(repo, branch)
+        except Exception as exc:  # noqa: BLE001 - cleanup is best effort
+            log.warning(
+                "could not delete branch %s for stream %s: %s",
+                branch,
+                name,
+                exc,
+            )
+            continue
+        if getattr(proc, "returncode", 0) != 0:
+            log.warning(
+                "could not delete branch %s for stream %s",
+                branch,
+                name,
+            )
+
+
 def cleanup_worktrees(
-    document: dict[str, Any], *, repo: Path, force: bool
+    document: dict[str, Any],
+    *,
+    repo: Path,
+    force: bool,
+    run_id: str,
+    graph_slug: str,
 ) -> None:
     repo = repo.resolve()
-    owned_root = (repo / ".herda" / "worktrees").resolve()
+    expected_root = (
+        repo / ".herda" / "worktrees" / graph_slug / run_id
+    ).resolve()
     streams = document.get("streams") or {}
     for name, info in streams.items():
         if not isinstance(info, dict):
@@ -119,23 +280,23 @@ def cleanup_worktrees(
             continue
         path = Path(str(raw_path)).resolve()
         try:
-            path.relative_to(owned_root)
+            path.relative_to(expected_root)
         except ValueError:
             log.warning(
                 "refusing to clean worktree outside %s: %s",
-                owned_root,
+                expected_root,
                 path,
             )
             continue
         if not path.exists():
             continue
-        remove_engine_dir(path)
         if worktree_is_dirty(path) and not force:
             raise CleanupError(
                 "dirty_worktree",
                 f"worktree for stream {name!r} has uncommitted changes: {path}",
                 "commit or discard the changes, or pass force=True",
             )
+        remove_engine_dir(path)
         remove_worktree(repo, path, force=force)
 
 

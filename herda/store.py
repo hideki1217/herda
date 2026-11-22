@@ -79,6 +79,12 @@ class RunStore:
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
         return path
 
+    def agent_session_dir(self, stream: str) -> Path:
+        path = self.run_dir / "agent-sessions" / stream
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _chmod_private(path)
+        return path
+
     def write_run(self, document: dict[str, Any]) -> None:
         atomic_write_json(self.run_json, document)
 
@@ -194,6 +200,7 @@ def run_document(
     streams: dict[str, Any],
     kernels: dict[str, Any],
     branches: dict[str, str],
+    agent: str | None = None,
 ) -> dict[str, Any]:
     return {
         "version": "0.1",
@@ -201,6 +208,7 @@ def run_document(
         "graph": graph_name,
         "graph_slug": graph_slug,
         "repo": str(repo),
+        "agent": agent,
         "state": state,
         "started_at": iso_utc(started_at),
         "finished_at": iso_utc(finished_at),

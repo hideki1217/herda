@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import runpy
 import sys
@@ -13,13 +14,16 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from herda import HerdaError, KernelState, RunState
+from herda import HerdaError, HerdaTimeoutError, KernelState, RunState
 from herda.backend import TerminalInfo
+from herda.doctor import Check
 from herda.cli import (
     _cmd_app_sync,
     _cmd_clean,
     _cmd_draw,
+    _cmd_doctor,
     _cmd_run,
+    _cmd_status,
     _cmd_validate,
     _load_graph,
     _print_error,
@@ -78,6 +82,11 @@ class FakeExecution:
 
     def cancel(self, *, grace_s: float = 10.0) -> None:
         self.cancelled = True
+
+
+class TimeoutExecution(FakeExecution):
+    def wait(self, timeout_s=None):
+        raise HerdaTimeoutError("wait_timeout", "timeout")
 
 
 class FakeGraph:
@@ -248,6 +257,142 @@ class CliTests(RepoCase):
         ), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(_cmd_run(SimpleNamespace(graph="g")), 0)
 
+    def test_cmd_doctor_json(self) -> None:
+        checks = [
+            Check("git", True, "ok", required=True),
+            Check("extra", False, "skip", required=False),
+        ]
+        out = io.StringIO()
+        with mock.patch(
+            "herda.cli.run_doctor", return_value=checks
+        ), contextlib.redirect_stdout(out):
+            self.assertEqual(
+                _cmd_doctor(SimpleNamespace(deep=False, app=False, json=True)),
+                0,
+            )
+        self.assertIn('"name": "git"', out.getvalue())
+
+    def test_cmd_run_timeout_cancels(self) -> None:
+        execution = TimeoutExecution()
+        graph = FakeGraph(execution)
+        with mock.patch(
+            "herda.cli._load_graph", return_value=graph
+        ), mock.patch(
+            "herda.cli.signal.getsignal", return_value=object()
+        ), mock.patch(
+            "herda.cli.signal.signal"
+        ), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(HerdaTimeoutError):
+                _cmd_run(SimpleNamespace(graph="g", timeout=1))
+        self.assertTrue(execution.cancelled)
+
+    def test_cmd_status(self) -> None:
+        run_id = "20260101T000000Z-abcdef"
+        run_dir = Path(self.repo) / ".herda" / "runs" / run_id
+        run_dir.mkdir(parents=True)
+        document = {
+            "run_id": run_id,
+            "graph": "g",
+            "state": "succeeded",
+            "agent": "pi",
+            "started_at": None,
+            "finished_at": None,
+            "kernels": {
+                "api/a": {
+                    "state": "succeeded",
+                    "status": "idle",
+                    "error": None,
+                },
+                "api/bad": {
+                    "state": "failed",
+                    "status": "error",
+                    "error": {"code": "x", "message": "bad"},
+                },
+                "not-dict": "x",
+            },
+        }
+        (run_dir / "run.json").write_text(
+            json.dumps(document), encoding="utf-8"
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(
+                _cmd_status(
+                    SimpleNamespace(
+                        repo=self.repo, run_id=None, json=False
+                    )
+                ),
+                0,
+            )
+        self.assertIn("agent: pi", out.getvalue())
+        self.assertIn("api/a: succeeded", out.getvalue())
+        self.assertIn("[x: bad]", out.getvalue())
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(
+                _cmd_status(
+                    SimpleNamespace(
+                        repo=self.repo, run_id=run_id, json=True
+                    )
+                ),
+                0,
+            )
+        self.assertIn(run_id, out.getvalue())
+
+        with self.assertRaises(HerdaError) as caught:
+            _cmd_status(
+                SimpleNamespace(
+                    repo=self.repo,
+                    run_id="20260101T000001Z-abcdef",
+                    json=False,
+                )
+            )
+        self.assertEqual(caught.exception.code, "run_not_found")
+
+        with self.assertRaises(HerdaError) as caught:
+            _cmd_status(
+                SimpleNamespace(repo=self.repo, run_id="bad", json=False)
+            )
+        self.assertEqual(caught.exception.code, "invalid_run_id")
+
+    def test_cmd_status_empty_and_invalid_json(self) -> None:
+        with self.assertRaises(HerdaError) as caught:
+            _cmd_status(
+                SimpleNamespace(repo=self.repo, run_id=None, json=False)
+            )
+        self.assertEqual(caught.exception.code, "run_not_found")
+
+        run_id = "20260101T000009Z-abcdef"
+        run_dir = Path(self.repo) / ".herda" / "runs" / run_id
+        run_dir.mkdir(parents=True)
+        (run_dir / "run.json").write_text("not json", encoding="utf-8")
+        with self.assertRaises(HerdaError) as caught:
+            _cmd_status(
+                SimpleNamespace(repo=self.repo, run_id=run_id, json=False)
+            )
+        self.assertEqual(caught.exception.code, "invalid_run_json")
+
+        (run_dir / "run.json").write_text("[]", encoding="utf-8")
+        with self.assertRaises(HerdaError) as caught:
+            _cmd_status(
+                SimpleNamespace(repo=self.repo, run_id=run_id, json=False)
+            )
+        self.assertEqual(caught.exception.code, "invalid_run_json")
+
+        (run_dir / "run.json").write_text(
+            json.dumps({"kernels": []}), encoding="utf-8"
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(
+                _cmd_status(
+                    SimpleNamespace(
+                        repo=self.repo, run_id=run_id, json=False
+                    )
+                ),
+                0,
+            )
+
     def test_cmd_clean(self) -> None:
         out = io.StringIO()
         with mock.patch("herda.cli.cleanup_run") as cleanup, contextlib.redirect_stdout(
@@ -258,11 +403,13 @@ class CliTests(RepoCase):
                     repo=self.repo,
                     run_id="run",
                     worktrees=True,
+                    branches=True,
                     force=True,
                 )
             )
         self.assertEqual(result, 0)
         cleanup.assert_called_once()
+        self.assertTrue(cleanup.call_args.kwargs["branches"])
         self.assertIn("cleaned run run", out.getvalue())
 
     def test_sync_once(self) -> None:

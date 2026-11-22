@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Mapping
 
 if TYPE_CHECKING:
     from .graph import Graph
@@ -20,6 +20,8 @@ class Kernel:
     model: str
     inherit_session: bool = False
     timeout_s: float | None = None
+    agent_args: tuple[str, ...] = ()
+    env: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def qualified_name(self) -> str:

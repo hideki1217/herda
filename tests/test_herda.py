@@ -575,7 +575,7 @@ class PreflightTests(RepoCase):
                 "--continue",
             ],
         )
-        self.assertEqual(env, {})
+        self.assertEqual(env, {"PI_PROGRAM_STATUS": "1"})
 
         argv, env = backend.launch_argv(
             "provider/model", inherit_session=False
@@ -583,7 +583,7 @@ class PreflightTests(RepoCase):
         self.assertEqual(
             argv, ["pi", "--no-approve", "--model", "provider/model"]
         )
-        self.assertEqual(env, {})
+        self.assertEqual(env, {"PI_PROGRAM_STATUS": "1"})
 
     def test_concurrent_run_lock(self) -> None:
         graph = self.graph(_backend=FakeBackend(hang={"api/slow"}))

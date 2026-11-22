@@ -8,13 +8,14 @@ events.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Mapping, Sequence
 
 from .errors import ValidationError
 from .event import Event
 from .kernel import Kernel
 from .naming import validate_name
 from .prompt import resolve_prompt
+from .timeouts import validate_timeout
 
 if TYPE_CHECKING:
     from .graph import Graph
@@ -44,6 +45,8 @@ class Stream:
         model: str | None = None,
         inherit_session: bool = False,
         timeout_s: float | None = None,
+        agent_args: Sequence[str] | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> Kernel:
         if self.graph._start_attempted:
             raise ValidationError(
@@ -66,10 +69,18 @@ class Stream:
                 f"kernel {self.name}/{name} has no model",
                 "pass model=... or set Graph.default_model",
             )
-        if timeout_s is not None and timeout_s <= 0:
+        resolved_timeout = validate_timeout(
+            f"kernel {self.name}/{name} timeout_s", timeout_s
+        )
+        if isinstance(agent_args, str):
             raise ValidationError(
-                "invalid_timeout",
-                f"kernel {self.name}/{name} timeout_s must be > 0 or None",
+                "invalid_agent_args",
+                f"kernel {self.name}/{name} agent_args must be a sequence",
+            )
+        if env is not None and not isinstance(env, Mapping):
+            raise ValidationError(
+                "invalid_env",
+                f"kernel {self.name}/{name} env must be a mapping",
             )
 
         previous = self._kernels[-1] if self._kernels else None
@@ -94,6 +105,15 @@ class Stream:
 
         prompt_path = resolve_prompt(self.graph.base_dir, prompt)
 
+        resolved_agent_args = (
+            tuple(str(arg) for arg in agent_args)
+            if agent_args is not None
+            else self.graph.agent_args
+        )
+        resolved_env = dict(self.graph.env)
+        if env is not None:
+            resolved_env.update({str(k): str(v) for k, v in env.items()})
+
         kernel = Kernel(
             graph=self.graph,
             stream=self,
@@ -101,7 +121,9 @@ class Stream:
             prompt=prompt_path,
             model=resolved_model,
             inherit_session=bool(inherit_session),
-            timeout_s=timeout_s,
+            timeout_s=resolved_timeout,
+            agent_args=resolved_agent_args,
+            env=resolved_env,
         )
         self._kernels.append(kernel)
         self.graph._kernels[kernel.qualified_name] = kernel

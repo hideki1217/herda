@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from .agent import PiAgent
 from .backend import Backend, TerminalInfo
 from .errors import HerdrError
 from .kernel import Kernel
@@ -69,6 +70,8 @@ class SessionRunner:
         cancel_event,
         ready_timeout_s: float,
         session_timeout_s: float | None,
+        blocked_timeout_s: float | None,
+        status_timeout_s: float | None,
         branches: dict[str, str],
         prompt_text: str,
         prompt_sha256: str,
@@ -82,6 +85,8 @@ class SessionRunner:
         self.cancel_event = cancel_event
         self.ready_timeout_s = ready_timeout_s
         self.session_timeout_s = session_timeout_s
+        self.blocked_timeout_s = blocked_timeout_s
+        self.status_timeout_s = status_timeout_s
         self.branches = branches
         self.prompt_text = prompt_text
         self.prompt_sha256 = prompt_sha256
@@ -91,6 +96,8 @@ class SessionRunner:
         self.terminal: str | None = None
         self.status: str | None = None
         self._started_at = _utcnow()
+        self._last_reported_at = time.monotonic()
+        self._blocked_since: float | None = None
 
     # -- entry point -----------------------------------------------------
 
@@ -128,27 +135,35 @@ class SessionRunner:
             error = ErrorInfo("internal", f"{type(exc).__name__}: {exc}")
 
         finished = _utcnow()
-        if self.terminal is not None:
-            output_path = self._save_screen()
-        self._write_meta(state, error, finished, output_path)
-
-        if self.terminal is not None:
-            if state == KernelState.succeeded:
-                final_label = "succeeded"
-            elif error is not None and error.code == "session_lost":
-                final_label = "lost"
-            else:
-                final_label = "failed"
-            self._label_state(final_label)
-            try:
-                self.backend.kill(self.terminal)
-            except HerdrError as exc:
-                log.debug("kill failed for %s: %s", self.terminal, exc)
-            finally:
+        try:
+            if self.terminal is not None:
+                output_path = self._save_screen()
+            self._write_meta(state, error, finished, output_path)
+        except Exception as exc:  # noqa: BLE001 - best effort
+            log.warning(
+                "could not finalize kernel %s: %s",
+                self.kernel.qualified_name,
+                exc,
+            )
+        finally:
+            # Reaping the terminal must never depend on screen/meta success.
+            if self.terminal is not None:
+                if state == KernelState.succeeded:
+                    final_label = "succeeded"
+                elif error is not None and error.code == "session_lost":
+                    final_label = "lost"
+                else:
+                    final_label = "failed"
+                self._label_state(final_label)
                 try:
-                    self.backend.rm(self.terminal)
-                except HerdrError as exc:
-                    log.debug("rm failed for %s: %s", self.terminal, exc)
+                    self.backend.kill(self.terminal)
+                except Exception as exc:  # noqa: BLE001 - best effort
+                    log.debug("kill failed for %s: %s", self.terminal, exc)
+                finally:
+                    try:
+                        self.backend.rm(self.terminal)
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug("rm failed for %s: %s", self.terminal, exc)
 
         return SessionOutcome(
             state=state,
@@ -170,25 +185,44 @@ class SessionRunner:
             raise _SessionFailure(
                 "internal", "stream worktree has not been created"
             )
-        env = {
+        session_dir = self.store.agent_session_dir(kernel.stream.name)
+        agent_name = getattr(
+            getattr(self.backend, "agent", None), "name", "pi"
+        )
+        herda_env = {
             "HERDA_RUN_ID": self.store.run_id,
             "HERDA_GRAPH": kernel.graph.name,
             "HERDA_STREAM": kernel.stream.name,
             "HERDA_KERNEL": kernel.name,
-            "HERDA_SESSION": f"{self.store.run_id}/{kernel.qualified_name}",
+            "HERDA_SESSION": (
+                f"{self.store.run_id}/{kernel.qualified_name}"
+            ),
             "HERDA_WORKTREE": str(worktree),
             "HERDA_BRANCH": kernel.stream.branch or "",
             "HERDA_BRANCHES": _json_dumps(self.branches),
+            "HERDA_AGENT": agent_name,
+            "HERDA_MODEL": kernel.model,
         }
-        argv = ["pi", "--no-approve", "--model", kernel.model]
-        if kernel.inherit_session:
-            argv.append("--continue")
         launch = getattr(self.backend, "launch_argv", None)
         if launch is not None:
             argv, extra_env = launch(
-                kernel.model, inherit_session=kernel.inherit_session
+                kernel.model,
+                inherit_session=kernel.inherit_session,
+                session_dir=session_dir,
+                extra_args=kernel.agent_args,
+                env=kernel.env,
             )
-            env.update(extra_env)
+        else:
+            argv, extra_env = PiAgent().launch_argv(
+                kernel.model,
+                inherit_session=kernel.inherit_session,
+                session_dir=session_dir,
+                extra_args=kernel.agent_args,
+                env=kernel.env,
+            )
+        env = dict(kernel.env)
+        env.update(extra_env)
+        env.update(herda_env)
 
         labels = {
             "herdr.space": kernel.graph.space_id,
@@ -224,6 +258,34 @@ class SessionRunner:
 
     # -- readiness -------------------------------------------------------
 
+    def _observe_timeouts(self, info: TerminalInfo) -> None:
+        now = time.monotonic()
+        if info.reported:
+            self._last_reported_at = now
+            if info.status == "blocked":
+                if self._blocked_since is None:
+                    self._blocked_since = now
+                if (
+                    self.blocked_timeout_s is not None
+                    and now - self._blocked_since > self.blocked_timeout_s
+                ):
+                    raise _SessionFailure(
+                        "blocked_timeout",
+                        "agent stayed blocked for "
+                        f"{self.blocked_timeout_s:g}s",
+                    )
+            else:
+                self._blocked_since = None
+        elif (
+            self.status_timeout_s is not None
+            and now - self._last_reported_at > self.status_timeout_s
+        ):
+            raise _SessionFailure(
+                "status_timeout",
+                "agent stopped reporting OSC 7501 status for "
+                f"{self.status_timeout_s:g}s",
+            )
+
     def _wait_ready(self) -> TerminalInfo:
         deadline = time.monotonic() + self.ready_timeout_s
         reported_any = False
@@ -251,6 +313,12 @@ class SessionRunner:
                     blocked_seen = True
                     self._label_state("awaiting_input")
                     self.on_state(KernelState.awaiting_input, info.status)
+                elif blocked_seen:
+                    blocked_seen = False
+                    deadline = time.monotonic() + self.ready_timeout_s
+                self._observe_timeouts(info)
+            elif reported_any:
+                self._observe_timeouts(info)
             if not blocked_seen and time.monotonic() >= deadline:
                 if not reported_any:
                     raise _SessionFailure(
@@ -283,6 +351,8 @@ class SessionRunner:
 
         self._label_state("sending")
         self.on_state(KernelState.running, self.status)
+        self._last_reported_at = time.monotonic()
+        self._blocked_since = None
         try:
             outcome = self.backend.send(
                 self._terminal_required(),
@@ -363,6 +433,7 @@ class SessionRunner:
                 raise _SessionFailure(
                     "session_lost", "terminal finished before the turn ended"
                 )
+            self._observe_timeouts(info)
             if info.reported:
                 self.status = info.status
                 status = info.status
@@ -410,6 +481,7 @@ class SessionRunner:
             info = self._get()
             if info.finished:
                 return info
+            self._observe_timeouts(info)
             if info.reported and info.status != "blocked":
                 return info
             if (
@@ -463,8 +535,12 @@ class SessionRunner:
             return
         try:
             self.backend.label(self.terminal, {"herda.state": state})
-        except HerdrError:
-            log.debug("could not update state label on %s", self.terminal)
+        except Exception as exc:  # noqa: BLE001 - labels are best effort
+            log.debug(
+                "could not update state label on %s: %s",
+                self.terminal,
+                exc,
+            )
 
     def _save_screen(self) -> Path | None:
         if self.terminal is None:

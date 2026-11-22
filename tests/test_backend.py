@@ -136,14 +136,14 @@ class BackendTests(unittest.TestCase):
                 "--continue",
             ],
         )
-        self.assertEqual(env, {})
+        self.assertEqual(env, {"PI_PROGRAM_STATUS": "1"})
 
         backend = HcBackend(hc="hc", pi="/custom/pi")
         argv, env = backend.launch_argv("p/m", inherit_session=False)
         self.assertEqual(
             argv, ["/custom/pi", "--no-approve", "--model", "p/m"]
         )
-        self.assertEqual(env, {})
+        self.assertEqual(env, {"PI_PROGRAM_STATUS": "1"})
 
     def test_run(self) -> None:
         with mock.patch(

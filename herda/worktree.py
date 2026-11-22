@@ -134,8 +134,8 @@ def branch_exists(repo: str | Path, branch: str) -> bool:
     return proc.returncode == 0
 
 
-def delete_branch(repo: str | Path, branch: str) -> None:
-    run_git(repo, "branch", "-D", branch, check=False)
+def delete_branch(repo: str | Path, branch: str) -> subprocess.CompletedProcess[str]:
+    return run_git(repo, "branch", "-D", branch, check=False)
 
 
 def create_worktree(

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import shutil
 import subprocess
 import tempfile
@@ -12,6 +11,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from .agent import PiAgent
 from .backend import HcBackend
 from .worktree import git_version
 
@@ -47,8 +47,12 @@ def _which_version(command: str, *args: str) -> tuple[bool, str]:
     return True, first
 
 
+def _hc_command() -> str:
+    return HcBackend().hc
+
+
 def _hc_status() -> tuple[bool, str]:
-    path = shutil.which("hc")
+    path = shutil.which(_hc_command())
     if path is None:
         return False, "not found in PATH"
     try:
@@ -74,18 +78,19 @@ def _hc_status() -> tuple[bool, str]:
 
 
 def _pi_command() -> str:
-    return os.environ.get("HERDA_PI") or "pi"
+    return PiAgent().executable
 
 
 def _deep_osc(timeout_s: float = 30.0) -> Check:
     pi = _pi_command()
-    if shutil.which("hc") is None or shutil.which(pi) is None:
+    backend = HcBackend()
+    hc = getattr(backend, "hc", "hc")
+    if shutil.which(hc) is None or shutil.which(pi) is None:
         return Check(
             "OSC 7501 (deep)",
             False,
             "skipped: hc or pi is missing",
         )
-    backend = HcBackend()
     temp = Path(tempfile.mkdtemp(prefix="herda-doctor-"))
     terminal = None
     try:
@@ -93,7 +98,7 @@ def _deep_osc(timeout_s: float = 30.0) -> Check:
         terminal = backend.run(
             worktree=temp,
             argv=[pi, "--no-session", "--no-approve"],
-            env={},
+            env={"PI_PROGRAM_STATUS": "1"},
             name=name,
             labels={"herda.owner": "herda-doctor"},
         )
@@ -109,11 +114,17 @@ def _deep_osc(timeout_s: float = 30.0) -> Check:
                 )
             if info.reported:
                 seen = info.status
-                if info.status in ("idle", "blocked", "done"):
+                if info.status in ("idle", "done"):
                     return Check(
                         "OSC 7501 (deep)",
                         True,
                         f"observed state={info.status!r}",
+                    )
+                if info.status == "blocked":
+                    return Check(
+                        "OSC 7501 (deep)",
+                        False,
+                        "observed blocked; resolve Pi login/trust first",
                     )
             time.sleep(0.25)
         if seen is None:
@@ -149,7 +160,7 @@ def run_doctor(*, deep: bool = False, app_check: bool = False) -> list[Check]:
         Check("git", git_ok, git_detail or git_version() or "missing")
     )
 
-    hc_ok, hc_detail = _which_version("hc", "--version")
+    hc_ok, hc_detail = _which_version(_hc_command(), "--version")
     checks.append(Check("hc", hc_ok, hc_detail))
     if hc_ok:
         core_ok, core_detail = _hc_status()

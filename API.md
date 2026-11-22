@@ -248,6 +248,10 @@ class Graph:
         max_parallel: int = 4,
         ready_timeout_s: float = 120.0,
         session_timeout_s: float | None = None,
+        blocked_timeout_s: float | None = 3600.0,
+        status_timeout_s: float | None = 300.0,
+        agent_args: Sequence[str] = (),
+        env: Mapping[str, str] | None = None,
     ) -> None: ...
 
     def stream(self, name: str, *, base: str = "HEAD") -> Stream: ...
@@ -264,6 +268,7 @@ class Graph:
         run_id: str,
         *,
         worktrees: bool = False,
+        branches: bool = False,
         force: bool = False,
     ) -> None: ...
 
@@ -284,17 +289,21 @@ class Graph:
 | `max_parallel` | `4` | 同時に実行する Session 数。 |
 | `ready_timeout_s` | `120.0` | terminal 起動から agent ready までの上限。 |
 | `session_timeout_s` | `None` | prompt 投入から完了までの上限。`None` は無制限。Kernel の `timeout_s` が優先。 |
+| `blocked_timeout_s` | `3600.0` | 連続 blocked の上限。`None` は無制限。 |
+| `status_timeout_s` | `300.0` | 最初の report 後に status が途切れてよい上限。`None` は無制限。 |
+| `agent_args` | `()` | すべての Kernel に渡す追加の agent CLI 引数。 |
+| `env` | `{}` | すべての Kernel に渡す追加環境変数。Kernel の `env` が優先。 |
 
 **セマンティクス**
 
 - `stream()` / `kernel()` は `start()` 前に呼ぶ。`start()` 後の変更は `ValidationError`。
-- `start()` は 1 つの Graph につき 1 回だけ。再実行する場合は新しい `Graph` を作る（run ごとに branch / worktree が変わるため）。
+- `start()` が成功した Graph は 1 回だけ実行できる。validate / preflight / lock / worktree 作成の失敗では `_start_attempted` を戻すため、修正後に同じ Graph で再試行できる。
 - `validate()` は副作用なし。名前、重複、空 Graph / Stream、循環、prompt、モデル、git を検査する。
 - `start()` は validate、worktree 作成、prompt スナップショットを行ってから実行を開始し、`Execution` を返す。
 - `run()` は `start()` + `wait()`。
 - Kernel の失敗は例外ではなく `KernelResult` に記録し、`RunState.failed` を返す。preflight 失敗だけが例外。
 - `draw()` は raw Mermaid を UTF-8 で書き、パスを返す。拡張子は `.mmd` / `.md`。
-- `cleanup()` は run の後始末。残っている run の terminal を kill / rm し、`worktrees=True` のときだけ worktree を削除する。worktree 削除前に engine-owned の `.herda/` を消し、dirty なら `force=True` が無い限り `CleanupError`。branch は削除しない。active な run（lock 保持中）には使えない。
+- `cleanup()` は run の後始末。terminal を labels で探して kill / rm し、`worktrees=True` のときだけ worktree を削除する。dirty なら `force=True` が無い限り `CleanupError`。`branches=True` のときだけ `herda/<graph_slug>/...` の branch を削除する。active な run（lock 保持中）には使えない。
 
 ### 5.4 `Stream`
 
@@ -314,6 +323,8 @@ class Stream:
         model: str | None = None,
         inherit_session: bool = False,
         timeout_s: float | None = None,
+        agent_args: Sequence[str] | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> Kernel: ...
 
     def record_event(self, name: str | None = None) -> Event: ...
@@ -348,12 +359,15 @@ class Kernel:
     model: str
     inherit_session: bool
     timeout_s: float | None
+    agent_args: tuple[str, ...]
+    env: Mapping[str, str]
 
     @property
     def qualified_name(self) -> str: ...   # "api/implement"
 ```
 
 - `timeout_s` は `Graph.session_timeout_s` をこの Kernel だけ上書きする。`None` なら Graph の値。
+- `agent_args` / `env` を省略すると `Graph.agent_args` / `Graph.env` を継承する。Kernel 側の `env` は Graph 側より優先。
 - Kernel 名は同じ Stream 内で一意。`"stream/kernel"` は Graph 内で一意。
 - Kernel に `depends_on` / 依存フィールドは無い。順序は Stream 内の宣言順と event wait から決まる。
 - `inherit_session=True` は同じ Stream の直前 Kernel がある場合だけ有効。
@@ -534,6 +548,7 @@ starting ── idle ──> ready ── send ──> sending ── working �
 - これが「セッションのリセット」。同じ worktree に idle の pi を残さない。
 - 次 Kernel は新しい terminal / 新しいプロセスで始まる。
 - `blocked` 待機中だけはプロセスを生かす。人間が herdr app で承認／回答する。
+- 最終化では、画面保存・meta 保存・label 更新・kill / rm のどこかが失敗しても、残りの回収処理を続ける。保存失敗は Kernel の成否を変えない。
 
 ### 7.3 Prompt
 
@@ -570,11 +585,12 @@ starting ── idle ──> ready ── send ──> sending ── working �
 herdr-core の OSC 7501 だけを使う。
 
 1. terminal 起動後、最初の status report を待つ。
-   - `idle` → ready。
-   - `blocked` → 人間待ち。ready タイムアウトの対象外で、解決するか cancel するまで待つ。解決後に `idle` を待つ。
+   - `idle` / `done` → ready。
+   - `blocked` → 人間待ち。`blocked_timeout_s` が経過したら `blocked_timeout`。
    - `error` → 失敗。
    - `ready_timeout_s` まで report が無い → 失敗（`status_unavailable`）。
    - report はあるが idle / blocked / error のどれでもないまま `ready_timeout_s` を超えた → 失敗（`agent_not_ready`）。
+   - 最初の report 後、`status_timeout_s` 以上 report が途切れた → `status_timeout`。
 2. prompt 投入直前の `turn` を `T0` とする。
 3. `hc send --wait` で prompt を投入する。
    - `started=false`: 15 秒まで `turn` / `working` を再観測。進まなければ失敗（`agent_not_started`）。
@@ -589,7 +605,8 @@ herdr-core の OSC 7501 だけを使う。
 6. screen を保存し、`hc kill` → `hc rm`。
 
 - `hc send --force` は使わない。承認を自動化しない。
-- prompt 投入後の `blocked` は `session_timeout_s` がある場合だけ打ち切る。無ければユーザーが cancel するまで待つ。起動時の `blocked`（trust dialog など）は `session_timeout_s` の対象外で、ユーザーが解決するか cancel するまで待つ。
+- prompt 投入後の `blocked` は `blocked_timeout_s` で打ち切る。`None` の場合はユーザーが cancel するまで待つ。起動時の `blocked`（trust dialog など）も同じ `blocked_timeout_s` の対象。
+- 最初の report 後に status report が `status_timeout_s` 以上途切れたら `status_timeout`。`working` のまま report が継続している長時間 tool 実行は対象外。
 - `restarted` / `lost` は失敗（`session_lost`）。herdr app の adoption で `keep` が有効になり代替シェルが起動した場合は、そのシェルを kill する。
 
 > 確認済み: Pi 1.6.0 を herdr-core 0.1.21 の terminal で起動すると、`hc get` に `{"app":"pi","state":"idle"}` が現れる。Pi 1.6+ は TUI から OSC 7501 を報告する。
@@ -604,6 +621,7 @@ herdr-core の OSC 7501 だけを使う。
     <run_id>/
       run.json
       prompts/<stream>/<kernel>.md         # prompt のスナップショット
+      agent-sessions/<stream>/             # Pi の session dir（run ごとに隔離）
       sessions/<stream>/<kernel>/
         screen.txt
         meta.json
@@ -612,9 +630,10 @@ herdr-core の OSC 7501 だけを使う。
 ```
 
 - `run_id` は `YYYYMMDDTHHMMSSZ-<random6>`（UTC、sortable）。
-- `run.json` は run の作成時に書き、終了時に state / finished_at を更新する。worktree / branch / Kernel の結果を含み、`Graph.cleanup(run_id)` が読む。
+- `run.json` は run の作成時に書き、状態遷移と終了時に state / finished_at を更新する。worktree / branch / Kernel の結果と agent 名を含み、`Graph.cleanup(run_id)` が読む。
 - `meta.json` は Kernel ごとの terminal address、status、時刻、エラーを保存する。
-- `screen.txt` は Session 終了時に `hc read` から保存する。
+- `screen.txt` は Session 終了時に `hc read` から保存する。保存失敗は Kernel を失敗させない。
+- `agent-sessions/<stream>/` は Pi の `--session-dir`。`inherit_session=True` は同じ Stream のこの dir で `--continue` する。
 - `locks/<graph_slug>.lock` は `flock`。同じ Graph の同時 run は `ConcurrentRunError`。app の space/tab と run 状態を一意に保つため。
 - `run.json` は atomic write（temp + rename）する。
 - **v0.1 は `run.json` から resume しない。** 記録は status 確認と cleanup のためだけに使う。
@@ -805,8 +824,12 @@ hc machine add --name devbox --install \
 | `HERDA_WORKTREE` | worktree パス |
 | `HERDA_BRANCH` | この Stream の branch |
 | `HERDA_BRANCHES` | 全 Stream の branch（JSON object） |
+| `HERDA_AGENT` | 実行 agent 名（現在は `pi`） |
+| `HERDA_MODEL` | この Kernel のモデル |
 
 - `HERDA_BRANCHES` は Stream 間の git 操作（`git log`、`merge`、`cherry-pick`）で上流 branch を知るために使う。
+- Pi には `PI_PROGRAM_STATUS=1` を渡し、OSC 7501 の報告を明示する。
+- Kernel の `env` は Graph の `env` を上書きする。`HERDA_*` は herda が最後に設定する。
 - その他の環境変数はユーザーのシェルから継承する。herda は secret を保存しない。
 
 ---
@@ -816,11 +839,12 @@ hc machine add --name devbox --install \
 Python ライブラリが主。CLI は最小限。
 
 ```bash
-herda doctor
+herda doctor [--deep] [--app] [--json]
 herda validate graph.py
-herda run graph.py                 # 完了までブロック。run_id と結果を表示
+herda run graph.py [--timeout SECONDS]  # 完了までブロック
+herda status [RUN_ID] [--json]          # run.json を表示
 herda draw graph.py -o dag.mmd
-herda clean RUN_ID [--worktrees] [--force]
+herda clean RUN_ID [--worktrees] [--branches] [--force]
 
 # ホスト側のみ。remote の space/tab 名を herda.* labels に合わせる（予定）
 herda app-sync
@@ -828,50 +852,158 @@ herda app-sync
 
 - `graph.py` はモジュールレベルに `graph` という `Graph` を持つ。
 - CLI は `graph.py` のあるディレクトリへ `chdir` してから import する。`base_dir` 未指定時の prompt 相対パスはそこを起点にする。
-- `herda run` は失敗時に exit 1。`SIGINT` / `SIGTERM` は `Execution.cancel()` にマップし、last state を表示して終了する。
+- `herda run` は失敗時に exit 1。`SIGINT` / `SIGTERM` は `Execution.cancel()` にマップし、last state を表示して終了する。`--timeout` は待ち時間超過時に run を cancel する。
 - `herda draw` は `-o -` で stdout。
 - `herda app-sync` はホスト側専用。local core の `hc events` / `hc ls` を監視し、`herda.space_name` / `herda.tab_name` に合わせて remote の space/tab を rename する（予定）。container 内では実行しない。
 - ライブの一覧・attach・ログは herdr app / `hc` を使う（`hc attach`、`hc read`）。
-- `herda clean` はカレントリポジトリの `.herda/runs/<run_id>/run.json` を読む。branch は削除しない。
+- `herda clean` はカレントリポジトリの `.herda/runs/<run_id>/run.json` を読む。branch は `--branches` 指定時だけ削除する。
+- `herda status` は run.json を読み取り専用で表示する。RUN_ID 省略時は最新 run。
 
 ---
 
-## 10. エラー
+## 10. エラーと異常系
 
-### 10.1 API の例外
+### 10.1 原則
 
-API の誤用・preflight 失敗だけが例外になる。すべて `HerdaError` の派生で、`code`, `message`, `hint` を持つ。
+herda の異常系は、次の不変条件を満たすように扱う。
 
-| 例外 | 発生条件 |
-|---|---|
-| `ValidationError` | 必須名、重複、空 Stream / Graph、DAG 循環、モデル未解決、`inherit_session` の指定ミス |
-| `PromptError` | `.md` でない、存在しない、空、読めない |
-| `WorktreeError` | worktree 作成、branch 衝突、git 失敗 |
-| `HerdrError` | `hc` 不在、core 不達、起動時の CLI エラー |
-| `HerdaTimeoutError` | `Execution.wait(timeout_s)` の待ち時間超過 |
-| `ConcurrentRunError` | 同じ Graph の run が既に実行中 |
-| `CleanupError` | active run、dirty worktree の削除要求 |
+1. **API 誤用とセットアップ失敗は例外**。run の副作用を作る前に `HerdaError` で止める。
+2. **実行中の Kernel 失敗はデータ**。例外にせず、`KernelResult.state` と `ErrorInfo.code` に残す。
+3. **開始した Kernel は必ず終端状態に到達する**。worker の内部例外も `internal` として記録し、`running` のまま放置しない。
+4. **開始した terminal は必ず回収を試みる**。保存や通知の失敗で kill / rm を飛ばさない。
+5. **cancel は冪等で有界**。何度呼んでも安全で、遅れて完了した worker が cancel 済みの結果を成功に上書きしない。
+6. **cleanup は冪等で所有権スコープ**。run_id と labels を検証し、別 run の terminal / worktree を触らない。
+7. **永続化は best effort**。`run.json` / `meta.json` / `screen.txt` の書き込み失敗で run の成否を変えない。
+8. **タイムアウトは有限**。`NaN` / `inf` は禁止。`None` は明示的な無制限だけに使う。
+9. **run の終端状態は一意**。全 Kernel が終端になった後、`RunState` は `succeeded` / `failed` / `canceled` のどれか 1 つに確定する。
+10. **既定で再試行しない**。失敗した Kernel は再実行せず、新しい run を作る。
 
-### 10.2 Kernel の失敗
+### 10.2 API の例外
+
+API の誤用・セットアップ失敗・cleanup の拒否だけが例外になる。すべて `HerdaError` の派生で、`code`, `message`, `hint` を持つ。
+
+| 例外 | 発生条件 | run の副作用 |
+|---|---|---|
+| `ValidationError` | 必須名、重複、空 Stream / Graph、DAG 循環、モデル未解決、`inherit_session` の指定ミス、不正な timeout | なし |
+| `PromptError` | `.md` でない、存在しない、空、読めない、UTF-8 でない | なし |
+| `WorktreeError` | worktree 作成、branch 衝突、git 失敗、base 解決失敗 | 作成済みの clean な worktree / branch は rollback |
+| `HerdrError` | `hc` 不在、core 不達、起動時の CLI エラー | なし（preflight 段階） |
+| `HerdaTimeoutError` | `Execution.wait(timeout_s)` / `wait_stream(timeout_s)` の待ち時間超過 | run は継続 |
+| `ConcurrentRunError` | 同じ Graph の run が既に実行中 | なし |
+| `CleanupError` | 不正な run_id、run.json の不一致、active run、dirty worktree、所有権外の path | 対象 resource は削除しない |
+
+`Graph.validate()` は副作用なし。`Graph.start()` は validate / preflight / lock / worktree 作成 / prompt snapshot のどこで失敗しても、**新規に作った worktree と branch を rollback** する。rollback 自体の失敗はログに残し、元の例外を優先する。
+
+### 10.3 Kernel の失敗コード
 
 実行中の失敗は例外にしない。`KernelResult.state=failed` または `skipped`、`ErrorInfo.code` で表す。
 
-| code | 意味 |
-|---|---|
-| `agent_not_ready` | ready タイムアウト |
-| `status_unavailable` | OSC 7501 が観測できない |
-| `agent_not_started` | prompt 投入後に working にならない |
-| `prompt_delivery` | `hc send` 失敗 |
-| `session_lost` | terminal / program 消失、`restarted` |
-| `timeout` | `session_timeout_s` 超過 |
-| `dependency` | 依存失敗による skip |
-| `canceled` | `cancel()` による中止 |
-| `herdr` | 実行中の `hc` エラー |
-| `internal` | 内部バグ |
+| code | 意味 | 主な state | 自動 retry |
+|---|---|---|---|
+| `agent_not_ready` | `ready_timeout_s` 内に idle / done にならない | failed | しない |
+| `status_unavailable` | 最初の OSC 7501 report が観測できない | failed | しない |
+| `status_timeout` | 最初の report 後、`status_timeout_s` 以上 report が途切れた | failed | しない |
+| `agent_not_started` | prompt 投入後に working / turn 進行が観測できない | failed | しない |
+| `prompt_delivery` | `hc send` が失敗した | failed | しない |
+| `session_lost` | terminal / program 消失、`restarted` / `lost` | failed | しない |
+| `timeout` | `session_timeout_s` / Kernel の `timeout_s` 超過 | failed | しない |
+| `blocked_timeout` | `blocked_timeout_s` 以上 blocked が続いた | failed | しない |
+| `dependency` | 依存 Kernel の failed / skipped / canceled | skipped | しない |
+| `canceled` | `Execution.cancel()` による中止 | canceled / skipped | しない |
+| `herdr` | 実行中の `hc` エラー | failed | しない |
+| `internal` | worker / adapter / 永続化の内部例外 | failed | しない |
 
 `Execution.wait()` は Kernel 失敗を例外にしない。run の `state` と `kernels` を見る。
 
----
+### 10.4 状態遷移
+
+Kernel の状態遷移は次のとおり。終端状態から非終端状態へは戻らない。
+
+```
+pending ──> ready ──> running ──> succeeded
+   │          │          │
+   │          │          ├──> awaiting_input ──> running
+   │          │          │                    ├──> succeeded
+   │          │          │                    └──> failed / canceled
+   │          │          ├──> failed
+   │          │          └──> canceled
+   │          ├──> skipped
+   │          └──> canceled
+   ├──> skipped
+   └──> canceled
+```
+
+- 終端状態: `succeeded`, `failed`, `skipped`, `canceled`。
+- `ready` と `awaiting_input` は非終端。
+- 1 Stream 内で `running` / `awaiting_input` は最大 1 つ。
+- Kernel の終端結果は 1 回だけ確定する。cancel 後に遅れて返った outcome は、cancel 済みの終端結果を上書きしない。
+- `RunState` は全 Kernel が終端になった時点で確定する。
+  - 全 Kernel が `succeeded` → `succeeded`
+  - `cancel_event` が立っている → `canceled`
+  - それ以外 → `failed`
+
+### 10.5 タイムアウト
+
+| 名前 | 既定 | 開始点 | 終了点 | `None` |
+|---|---|---|---|---|
+| `ready_timeout_s` | `120.0` | terminal 起動 | 最初の `idle` / `done` report | 禁止 |
+| `session_timeout_s` | `None` | prompt 投入 | turn 完了 | 無制限 |
+| `blocked_timeout_s` | `3600.0` | 最後に `blocked` を観測 | `blocked` が解消 | 無制限 |
+| `status_timeout_s` | `300.0` | 最後に status report を観測 | 次の report | 無制限 |
+| `Execution.wait(timeout_s)` | `None` | 呼び出し | run 終端 | 無制限 |
+
+- `ready_timeout_s` / `blocked_timeout_s` / `status_timeout_s` / `session_timeout_s` は `> 0` かつ finite。`NaN` / `inf` は `ValidationError`。
+- `status_timeout_s` は「report が途切れた」ことを検知する。`working` のまま report が継続している長時間 tool 実行は対象外。
+- `blocked_timeout_s` は連続 blocked 時間。`blocked` が解消したらリセットする。
+- `Execution.wait(timeout_s)` は呼び出し側の待ち時間だけで、run を cancel しない。継続する場合は再度 `wait()` する。
+- `Kernel.timeout_s` は `Graph.session_timeout_s` をその Kernel だけ上書きする。
+
+### 10.6 キャンセル
+
+`Execution.cancel(*, grace_s=10.0)` のセマンティクス:
+
+1. 冪等。既に終端なら何もしない。
+2. `cancel_event` を立てる。
+3. `running` / `awaiting_input` の terminal に `interrupt` を送る。
+4. `grace_s` の範囲で worker の終了を待つ。
+5. 残っている terminal を `kill` → `rm` する。
+6. 非終端の Kernel を `canceled` または `skipped` に確定する。
+7. worker を有界時間で join し、`RunState.canceled` に確定する。
+8. 期限内に終わらない worker はログに残す。遅れて返った outcome は cancel 済みの結果を上書きしない。
+
+`grace_s < 0` は 0 として扱う。cancel は run の lock を解放するが、orphan worker が残った場合はその事実をログに残す。
+
+### 10.7 Cleanup
+
+`Graph.cleanup(run_id, *, worktrees=False, branches=False, force=False)` / `herda clean` のセマンティクス:
+
+- `run_id` は `YYYYMMDDTHHMMSSZ-<hex6>` のみ許可する。`/`, `..`, 絶対パスは `CleanupError`。
+- `<repo>/.herda/runs/<run_id>/run.json` が存在し、`document["run_id"] == run_id` でなければ `CleanupError`。
+- active な Graph lock があれば `CleanupError`。
+- terminal は保存された address だけでなく、`herda.owner=herda` かつ `herda.run=<run_id>` の labels で探す。address が別 run に再利用されていても、labels が一致しない terminal は触らない。
+- terminal cleanup が成功した場合、`run.json` の `terminal` を `null` にし、`cleaned_at` を記録する。再実行しても二重 kill しない。
+- worktree は `<repo>/.herda/worktrees/<graph_slug>/<run_id>/` の配下だけを削除する。path は `resolve()` 後に containment を確認する。
+- dirty worktree は `force=True` がない限り削除しない。**dirty 判定は `.herda/` の削除より前**に行う。
+- branch は既定では削除しない。`branches=True` のときだけ `herda/<graph_slug>/` prefix を確認して削除する。
+- cleanup の途中で 1 terminal の kill / rm が失敗しても、他の terminal と worktree の cleanup は続行し、失敗をログに残す。
+- cleanup 後に残る `run.json` / `screen.txt` / `meta.json` は監査用に保持する。
+
+### 10.8 永続化と観測
+
+- `run.json` は atomic write（temp + rename）する。書き込み失敗は run を失敗させない。
+- `meta.json` / `screen.txt` の保存失敗も Kernel の成否を変えない。失敗はログに残す。
+- Kernel の状態遷移は `run.json` に反映する。高頻度の同じ状態は dedupe する。
+- `run.json` には少なくとも `run_id`, `graph`, `agent`, `state`, `streams`, `kernels`, `started_at`, `finished_at` を含める。
+- `KernelResult` の `terminal`, `status`, `error`, `output_path` は最終的に確定した値を保持する。
+- engine が異常終了した場合、`run.json` の `state=running` が残ることがある。v0.1 は resume しない。`herda clean` と herdr の `hc` で手動回復する。
+
+### 10.9 再試行と回復
+
+- v0.1 は Kernel / run の自動 retry をしない。
+- 失敗した Kernel の下流は `skipped` になる。無関係な Stream は継続する。
+- 新しい run は新しい worktree / branch / session dir を作る。
+- `run.json` からの resume、Kernel 単体 retry、agent の session id 指定は将来候補（§13）。
+- cleanup は冪等なので、失敗した cleanup を再実行してよい。
 
 ## 11. セキュリティ
 
@@ -879,8 +1011,9 @@ API の誤用・preflight 失敗だけが例外になる。すべて `HerdaError
 - herda は worktree の外のファイルを削除しない。`git clean` / `git reset --hard` を使わない。
 - 未コミット変更のある worktree は `force=True` なしで削除しない。
 - `hc send --force` は使わない。Pi は `--no-approve` で project-local resources を読み込まず、trust dialog を自動承認しない。
-- `.herda/` は git 管理外にし、可能なら 0700 にする。
-- prompt / screen には secret が入り得る。
+- `herda clean` は run_id / run.json / labels / path containment を検証し、別 run の terminal / worktree を削除しない。
+- `.herda/` は git 管理外にし、0700 にする。run 配下の session / screen / meta は secret を含み得る。
+- prompt / screen / agent session には secret が入り得る。
 
 ---
 
@@ -898,7 +1031,14 @@ API の誤用・preflight 失敗だけが例外になる。すべて `HerdaError
 8. event の元 Kernel が失敗したとき、wait した Stream の下流が `skipped`、無関係な Stream は完走。
 9. `cancel()` / `Execution.wait_stream()` / `query_stream()` が正しい状態になる。
 10. `to_mermaid()` のスナップショット。
-11. `cleanup(worktrees=True)` が dirty worktree を拒否する。
+11. `cleanup(worktrees=True)` が dirty worktree を拒否し、dirty 判定前に `.herda/` を消さない。
+12. `cleanup` が run_id / run.json / labels / path containment を検証し、再実行しても二重 kill しない。
+13. worker の内部例外が `internal` になり、terminal が kill / rm される。
+14. `cancel()` が冪等で、遅れた worker の outcome が canceled を上書きしない。
+15. `blocked_timeout` / `status_timeout` / `session_timeout` が発火する。
+16. `NaN` / `inf` の timeout が `ValidationError` になる。
+17. agent adapter が `--session-dir` / `agent_args` / `env` / `PI_PROGRAM_STATUS=1` を組み立てる。
+18. `herda status` が run.json を読み取り専用で表示する。
 
 ### 12.2 統合（実 herdr-core + pi）
 
@@ -930,17 +1070,17 @@ API の誤用・preflight 失敗だけが例外になる。すべて `HerdaError
 | prompt templating | 動的な値は `HERDA_BRANCHES` などの環境変数で渡す。 |
 | DOT / SVG 描画 | Mermaid で足りる。 |
 | 明示 branch / worktree / slug | 自動命名で足りる。 |
-| カスタム agent / env / labels | pi 専用で十分。 |
+| カスタム agent | v0.1 は Pi adapter のみ。agent_args / env は Graph / Kernel で指定できる。 |
 | herdr app の space/tab 手動指定 | 自動 ID + rename で足りる。 |
 | worktree の自動削除 | 成果を守る。明示 `cleanup` のみ。 |
-| branch の自動削除 | 成果を守る。git に任せる。 |
+| branch の自動削除 | 既定では削除しない。`clean --branches` で明示的に削除する。 |
 
 ### 13.2 既知の制限
 
-- engine が死ぬと DAG は止まる。herdr terminal は生き残るので `hc attach` で状態を見られるが、次の Kernel には進まない。残った terminal / worktree は `herda clean RUN_ID [--worktrees]` で片付ける。
-- `pi --continue` は worktree 内の最後の会話を選ぶ。同じ worktree で手動 pi を動かすと誤る。
+- engine が死ぬと DAG は止まる。herdr terminal は生き残るので `hc attach` で状態を見られるが、次の Kernel には進まない。残った terminal / worktree は `herda clean RUN_ID [--worktrees] [--branches]` で片付ける。
+- Pi の session は `<run_dir>/agent-sessions/<stream>/` に隔離される。同じ worktree で手動 pi を動かしても、herda の `--session-dir` とは混ざらない。
 - herdr app の space/tab 名は、`herdr-app` CLI が使えないと既定名になる。
-- `blocked` は `session_timeout_s` が無ければユーザーが cancel するまで待つ。
+- `blocked` は既定で `blocked_timeout_s=3600`。`None` を指定した場合だけユーザーが cancel するまで待つ。
 - 1 つの Graph は 1 つのリポジトリだけ。
 
 ### 13.3 将来候補

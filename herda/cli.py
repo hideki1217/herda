@@ -4,21 +4,25 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import logging
 import os
 import signal
 import sys
 import time
 import uuid
+from dataclasses import asdict
 from pathlib import Path
 
 from . import app
 from .backend import HcBackend
-from .cleanup import cleanup_run
+from .cleanup import cleanup_run, validate_run_id
 from .doctor import print_checks, run_doctor
-from .errors import HerdaError
+from .errors import HerdaError, HerdaTimeoutError
 from .graph import Graph
+from .store import read_json
 from .types import RunState
+from .worktree import require_git_repo
 
 log = logging.getLogger("herda")
 
@@ -73,6 +77,11 @@ def _print_error(exc: HerdaError) -> None:
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
     checks = run_doctor(deep=args.deep, app_check=args.app)
+    if getattr(args, "json", False):
+        print(json.dumps([asdict(check) for check in checks], indent=2))
+        return 0 if all(
+            check.ok or not check.required for check in checks
+        ) else 1
     return print_checks(checks)
 
 
@@ -132,7 +141,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
         except (ValueError, OSError):
             pass
     try:
-        execution.wait()
+        try:
+            execution.wait(timeout_s=getattr(args, "timeout", None))
+        except HerdaTimeoutError:
+            log.warning(
+                "run %s exceeded its CLI timeout; canceling it",
+                execution.id,
+            )
+            execution.cancel(grace_s=5.0)
+            raise
     finally:
         for sig, handler in previous.items():
             try:
@@ -149,9 +166,74 @@ def _cmd_clean(args: argparse.Namespace) -> int:
         Path(args.repo),
         args.run_id,
         worktrees=args.worktrees,
+        branches=getattr(args, "branches", False),
         force=args.force,
     )
     print(f"cleaned run {args.run_id}")
+    return 0
+
+
+def _cmd_status(args: argparse.Namespace) -> int:
+    root = require_git_repo(args.repo)
+    runs_dir = root / ".herda" / "runs"
+    run_id = getattr(args, "run_id", None)
+    if run_id:
+        run_id = validate_run_id(run_id)
+    else:
+        candidates = (
+            [
+                path.name
+                for path in runs_dir.iterdir()
+                if (path / "run.json").exists()
+            ]
+            if runs_dir.exists()
+            else []
+        )
+        if not candidates:
+            raise HerdaError(
+                "run_not_found", "no herda runs were found"
+            )
+        run_id = max(candidates)
+
+    run_json = runs_dir / run_id / "run.json"
+    if not run_json.exists():
+        raise HerdaError(
+            "run_not_found", f"run {run_id!r} was not found"
+        )
+    try:
+        document = read_json(run_json)
+    except (OSError, ValueError) as exc:
+        raise HerdaError(
+            "invalid_run_json", f"could not read {run_json}: {exc}"
+        ) from exc
+    if not isinstance(document, dict):
+        raise HerdaError(
+            "invalid_run_json", f"{run_json} must contain a JSON object"
+        )
+
+    if getattr(args, "json", False):
+        print(json.dumps(document, indent=2, sort_keys=True))
+        return 0
+
+    print(f"run_id: {document.get('run_id', run_id)}")
+    print(f"graph: {document.get('graph')}")
+    print(f"state: {document.get('state')}")
+    print(f"agent: {document.get('agent')}")
+    print(f"started_at: {document.get('started_at')}")
+    print(f"finished_at: {document.get('finished_at')}")
+    kernels = document.get("kernels", {})
+    if not isinstance(kernels, dict):
+        kernels = {}
+    for name, result in kernels.items():
+        if not isinstance(result, dict):
+            continue
+        line = f"  {name}: {result.get('state')}"
+        if result.get("status"):
+            line += f" (status={result.get('status')})"
+        error = result.get("error")
+        if isinstance(error, dict):
+            line += f" [{error.get('code')}: {error.get('message')}]"
+        print(line)
     return 0
 
 
@@ -239,6 +321,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also check for herdr-app",
     )
+    doctor.add_argument(
+        "--json", action="store_true", help="print checks as JSON"
+    )
     doctor.set_defaults(func=_cmd_doctor)
 
     validate = sub.add_parser("validate", help="validate a graph module")
@@ -247,6 +332,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="run a graph until it finishes")
     run.add_argument("graph")
+    run.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="cancel the run after this many seconds",
+    )
     run.set_defaults(func=_cmd_run)
 
     draw = sub.add_parser("draw", help="write the DAG as Mermaid")
@@ -260,9 +351,20 @@ def build_parser() -> argparse.ArgumentParser:
     clean = sub.add_parser("clean", help="clean terminals/worktrees of a run")
     clean.add_argument("run_id")
     clean.add_argument("--worktrees", action="store_true")
+    clean.add_argument(
+        "--branches",
+        action="store_true",
+        help="also delete herda branches for this run",
+    )
     clean.add_argument("--force", action="store_true")
     clean.add_argument("--repo", default=".")
     clean.set_defaults(func=_cmd_clean)
+
+    status = sub.add_parser("status", help="show a run")
+    status.add_argument("run_id", nargs="?")
+    status.add_argument("--json", action="store_true")
+    status.add_argument("--repo", default=".")
+    status.set_defaults(func=_cmd_status)
 
     app_sync = sub.add_parser(
         "app-sync",

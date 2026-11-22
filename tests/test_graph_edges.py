@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import time
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
 
@@ -59,6 +60,46 @@ class GraphEdgeTests(RepoCase):
                 default_model="m",
                 session_timeout_s=0,
             )
+        with self.assertRaises(ValidationError):
+            Graph(
+                "g",
+                self.repo,
+                default_model="m",
+                blocked_timeout_s=0,
+            )
+        with self.assertRaises(ValidationError):
+            Graph(
+                "g",
+                self.repo,
+                default_model="m",
+                status_timeout_s=float("nan"),
+            )
+        with self.assertRaises(ValidationError):
+            Graph(
+                "g",
+                self.repo,
+                default_model="m",
+                agent_args="--x",  # type: ignore[arg-type]
+            )
+        with self.assertRaises(ValidationError):
+            Graph(
+                "g",
+                self.repo,
+                default_model="m",
+                env=[],  # type: ignore[arg-type]
+            )
+        graph = self.graph(
+            agent_args=("--no-extensions",),
+            env={"A": "1", "B": "2"},
+        )
+        kernel = graph.stream("api").kernel(
+            "a",
+            self.prompt,
+            agent_args=("--thinking", "high"),
+            env={"B": "3"},
+        )
+        self.assertEqual(kernel.agent_args, ("--thinking", "high"))
+        self.assertEqual(kernel.env, {"A": "1", "B": "3"})
 
     def test_stream_after_start_and_slug_collision(self) -> None:
         graph = self.graph()
@@ -139,6 +180,10 @@ class GraphEdgeTests(RepoCase):
         branches = _git(self.repo, "branch", "--list", "herda/*").stdout
         self.assertEqual(branches.strip(), "")
 
+        # A failed start before a run began must not poison the Graph object.
+        execution = graph.start()
+        self.assertEqual(execution.wait().state, RunState.succeeded)
+
     def test_prepare_dir_chmod_error(self) -> None:
         graph = self.graph()
         target = Path(self.root) / "herda-dir"
@@ -204,6 +249,12 @@ class StreamEdgeTests(RepoCase):
             stream.kernel("a", self.prompt, model="")
         with self.assertRaises(ValidationError):
             stream.kernel("b", self.prompt, timeout_s=0)
+        with self.assertRaises(ValidationError):
+            stream.kernel("c", self.prompt, timeout_s=float("inf"))
+        with self.assertRaises(ValidationError):
+            stream.kernel("d", self.prompt, agent_args="--x")  # type: ignore[arg-type]
+        with self.assertRaises(ValidationError):
+            stream.kernel("e", self.prompt, env=[])  # type: ignore[arg-type]
 
     def test_event_validation_and_properties(self) -> None:
         graph = self.graph()
@@ -317,6 +368,84 @@ class ExecutionEdgeTests(RepoCase):
         self.assertEqual(
             execution.kernels["api/a"].error.code, "internal"
         )
+
+    def test_worker_crash_marks_kernel_failed(self) -> None:
+        class Runner:
+            terminal = "t1"
+            status = "working"
+
+            def run(self):
+                raise RuntimeError("boom")
+
+        backend = FakeBackend()
+        graph = self.graph(_backend=backend)
+        graph.stream("api", base="main").kernel("a", self.prompt)
+        with mock.patch(
+            "herda.execution.SessionRunner", return_value=Runner()
+        ):
+            with self.assertLogs("herda", level="ERROR"):
+                execution = graph.start()
+                execution.synchronize()
+        result = execution.kernels["api/a"]
+        self.assertEqual(result.state.value, "failed")
+        self.assertEqual(result.error.code, "internal")
+
+    def test_on_state_is_deduped(self) -> None:
+        backend = FakeBackend()
+        graph = self.graph(_backend=backend)
+        kernel = graph.stream("api", base="main").kernel("a", self.prompt)
+        execution = graph.run()
+        result = execution.kernels["api/a"]
+        execution._on_state(kernel, result.state, result.status)
+
+    def test_cancel_logs_alive_workers(self) -> None:
+        class AliveThread:
+            name = "alive"
+
+            def join(self, timeout=None):
+                return None
+
+            def is_alive(self):
+                return True
+
+        backend = FakeBackend(hang={"api/slow"})
+        graph = self.graph(_backend=backend)
+        graph.stream("api", base="main").kernel("slow", self.prompt)
+        execution = graph.start()
+        execution._threads.append(AliveThread())  # type: ignore[arg-type]
+        fake_time = SimpleNamespace(
+            monotonic=mock.Mock(side_effect=[0, 1000])
+        )
+        with mock.patch(
+            "herda.execution.time", fake_time
+        ), self.assertLogs("herda", level="WARNING"):
+            execution.cancel(grace_s=0)
+        self.assertEqual(execution.state, RunState.canceled)
+
+    def test_scheduler_logs_alive_workers(self) -> None:
+        class AliveThread:
+            name = "alive"
+
+            def join(self, timeout=None):
+                return None
+
+            def is_alive(self):
+                return True
+
+        backend = FakeBackend()
+        graph = self.graph(_backend=backend)
+        graph.stream("api", base="main").kernel("a", self.prompt)
+        execution = graph.run()
+        assert execution._scheduler is not None
+        execution._scheduler.join()
+        execution._threads.append(AliveThread())  # type: ignore[arg-type]
+        fake_time = SimpleNamespace(
+            monotonic=mock.Mock(side_effect=[0, 1000])
+        )
+        with mock.patch(
+            "herda.execution.time", fake_time
+        ), self.assertLogs("herda", level="WARNING"):
+            execution._schedule()
 
     def test_persist_oserror(self) -> None:
         graph = self.graph()

@@ -8,7 +8,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal, Mapping
+from typing import Literal, Mapping, Sequence
 
 from . import app
 from .backend import Backend, HcBackend
@@ -29,6 +29,7 @@ from .naming import (
 from .prompt import load_prompt, prompt_sha256
 from .store import GraphLock, RunStore
 from .stream import Stream
+from .timeouts import validate_timeout
 from .worktree import (
     create_worktree,
     delete_branch,
@@ -57,6 +58,10 @@ class Graph:
         max_parallel: int = 4,
         ready_timeout_s: float = 120.0,
         session_timeout_s: float | None = None,
+        blocked_timeout_s: float | None = 3600.0,
+        status_timeout_s: float | None = 300.0,
+        agent_args: Sequence[str] = (),
+        env: Mapping[str, str] | None = None,
         _backend: Backend | None = None,
     ) -> None:
         validate_name("Graph", name)
@@ -64,21 +69,25 @@ class Graph:
             raise ValidationError(
                 "model_required",
                 "Graph.default_model must not be empty",
-                "use pi's provider/model form, e.g. "
-                "anthropic/claude-sonnet-5-5",
+                "use the agent's provider/model form, e.g. provider/model",
             )
-        if not isinstance(max_parallel, int) or max_parallel < 1:
+        if (
+            not isinstance(max_parallel, int)
+            or isinstance(max_parallel, bool)
+            or max_parallel < 1
+        ):
             raise ValidationError(
                 "invalid_max_parallel",
                 "max_parallel must be an integer >= 1",
             )
-        if ready_timeout_s <= 0:
+        if isinstance(agent_args, str):
             raise ValidationError(
-                "invalid_timeout", "ready_timeout_s must be > 0"
+                "invalid_agent_args",
+                "agent_args must be a sequence of arguments, not a string",
             )
-        if session_timeout_s is not None and session_timeout_s <= 0:
+        if env is not None and not isinstance(env, Mapping):
             raise ValidationError(
-                "invalid_timeout", "session_timeout_s must be > 0 or None"
+                "invalid_env", "env must be a mapping of strings to strings"
             )
 
         self.name = name
@@ -88,8 +97,20 @@ class Graph:
             Path.cwd() if base_dir is None else Path(base_dir)
         ).expanduser().resolve()
         self.max_parallel = max_parallel
-        self.ready_timeout_s = float(ready_timeout_s)
-        self.session_timeout_s = session_timeout_s
+        self.ready_timeout_s = validate_timeout(
+            "ready_timeout_s", ready_timeout_s, allow_none=False
+        )
+        self.session_timeout_s = validate_timeout(
+            "session_timeout_s", session_timeout_s
+        )
+        self.blocked_timeout_s = validate_timeout(
+            "blocked_timeout_s", blocked_timeout_s
+        )
+        self.status_timeout_s = validate_timeout(
+            "status_timeout_s", status_timeout_s
+        )
+        self.agent_args = tuple(str(arg) for arg in agent_args)
+        self.env = {str(k): str(v) for k, v in (env or {}).items()}
         self.slug = slugify(name, fallback="graph")
         self.space_id = make_space_id(self.slug, str(self.repo), name)
 
@@ -101,6 +122,7 @@ class Graph:
         self.tab_ids: dict[str, str] = {}
         self.terminal_names: dict[str, str] = {}
         self._start_attempted = False
+        self._start_lock = threading.Lock()
         self._backend = _backend
         self._app_sync_started = False
 
@@ -212,126 +234,145 @@ class Graph:
     # -- execution -------------------------------------------------------
 
     def start(self) -> Execution:
-        if self._start_attempted:
-            raise ValidationError(
-                "graph_started",
-                "Graph.start() can only be called once",
-                "create a new Graph for another run",
-            )
-        self._start_attempted = True
-        self.validate()
-
-        backend = self._backend
-        if backend is None:
-            backend = HcBackend()
-            self._backend = backend
-        backend.preflight()
-
-        herda_dir = self.repo / ".herda"
-        self._prepare_herda_dir(herda_dir)
-        lock = GraphLock(herda_dir / "locks" / f"{self.slug}.lock")
-        lock.acquire()
-
-        created: list[tuple[Path, str]] = []
-        try:
-            run_id = self._new_run_id()
-            run6 = run_id[-6:]
-            store = RunStore(herda_dir, run_id)
-            base_commits: dict[str, str] = {}
-            branches: dict[str, str] = {}
-            worktrees: dict[str, Path] = {}
-
-            for stream in self._streams.values():
-                base_commits[stream.name] = resolve_commit(
-                    self.repo, stream.base
+        with self._start_lock:
+            if self._start_attempted:
+                raise ValidationError(
+                    "graph_started",
+                    "Graph.start() can only be called once",
+                    "create a new Graph for another run",
                 )
-                branch = (
-                    f"herda/{self.slug}/"
-                    f"{self._stream_slugs[stream.name]}-{run6}"
-                )
-                path = (
-                    herda_dir
-                    / "worktrees"
-                    / self.slug
-                    / run_id
-                    / self._stream_slugs[stream.name]
-                )
-                created_worktree = create_worktree(
-                    self.repo, path, branch, base_commits[stream.name]
-                )
-                created.append((created_worktree, branch))
-                branches[stream.name] = branch
-                worktrees[stream.name] = created_worktree
+            self._start_attempted = True
+            started_ok = False
+            try:
+                self.validate()
 
-            ensure_main_exclude(self.repo)
-            for path in worktrees.values():
-                init_worktree_herda(path)
+                backend = self._backend
+                if backend is None:
+                    backend = HcBackend()
+                    self._backend = backend
+                backend.preflight()
 
-            prompt_texts: dict[str, str] = {}
-            prompt_shas: dict[str, str] = {}
-            large_prompts: dict[str, Path] = {}
-            for kernel in self._kernels.values():
-                text = load_prompt(kernel.prompt)
-                prompt_texts[kernel.qualified_name] = text
-                prompt_shas[kernel.qualified_name] = prompt_sha256(text)
-                snapshot = store.prompt_snapshot_path(
-                    kernel.stream.name, kernel.name
+                herda_dir = self.repo / ".herda"
+                self._prepare_herda_dir(herda_dir)
+                lock = GraphLock(
+                    herda_dir / "locks" / f"{self.slug}.lock"
                 )
-                snapshot.write_text(text, encoding="utf-8")
-                if len(text.encode("utf-8")) > PROMPT_INLINE_LIMIT:
-                    large_prompts[kernel.qualified_name] = write_large_prompt(
-                        worktrees[kernel.stream.name],
-                        kernel.stream.name,
-                        kernel.name,
-                        text,
+                lock.acquire()
+
+                created: list[tuple[Path, str]] = []
+                try:
+                    run_id = self._new_run_id()
+                    run6 = run_id[-6:]
+                    store = RunStore(herda_dir, run_id)
+                    base_commits: dict[str, str] = {}
+                    branches: dict[str, str] = {}
+                    worktrees: dict[str, Path] = {}
+
+                    for stream in self._streams.values():
+                        base_commits[stream.name] = resolve_commit(
+                            self.repo, stream.base
+                        )
+                        branch = (
+                            f"herda/{self.slug}/"
+                            f"{self._stream_slugs[stream.name]}-{run6}"
+                        )
+                        path = (
+                            herda_dir
+                            / "worktrees"
+                            / self.slug
+                            / run_id
+                            / self._stream_slugs[stream.name]
+                        )
+                        created_worktree = create_worktree(
+                            self.repo,
+                            path,
+                            branch,
+                            base_commits[stream.name],
+                        )
+                        created.append((created_worktree, branch))
+                        branches[stream.name] = branch
+                        worktrees[stream.name] = created_worktree
+
+                    ensure_main_exclude(self.repo)
+                    for path in worktrees.values():
+                        init_worktree_herda(path)
+
+                    prompt_texts: dict[str, str] = {}
+                    prompt_shas: dict[str, str] = {}
+                    large_prompts: dict[str, Path] = {}
+                    for kernel in self._kernels.values():
+                        text = load_prompt(kernel.prompt)
+                        prompt_texts[kernel.qualified_name] = text
+                        prompt_shas[kernel.qualified_name] = prompt_sha256(
+                            text
+                        )
+                        snapshot = store.prompt_snapshot_path(
+                            kernel.stream.name, kernel.name
+                        )
+                        snapshot.write_text(text, encoding="utf-8")
+                        if (
+                            len(text.encode("utf-8"))
+                            > PROMPT_INLINE_LIMIT
+                        ):
+                            large_prompts[
+                                kernel.qualified_name
+                            ] = write_large_prompt(
+                                worktrees[kernel.stream.name],
+                                kernel.stream.name,
+                                kernel.name,
+                                text,
+                            )
+
+                    for stream in self._streams.values():
+                        stream.branch = branches[stream.name]
+                        stream.worktree = worktrees[stream.name]
+
+                    self.terminal_names = {
+                        kernel.qualified_name: terminal_name(
+                            self._stream_slugs[kernel.stream.name],
+                            slugify(kernel.name, fallback="kernel"),
+                            run_id,
+                            kernel.stream.name,
+                            kernel.name,
+                        )
+                        for kernel in self._kernels.values()
+                    }
+
+                    streams_doc = {
+                        stream.name: {
+                            "name": stream.name,
+                            "base": stream.base,
+                            "base_commit": base_commits[stream.name],
+                            "branch": branches[stream.name],
+                            "worktree": str(worktrees[stream.name]),
+                            "space_id": self.space_id,
+                            "tab_id": self.tab_ids[stream.name],
+                        }
+                        for stream in self._streams.values()
+                    }
+
+                    execution = Execution(
+                        graph=self,
+                        run_id=run_id,
+                        store=store,
+                        lock=lock,
+                        backend=backend,
+                        streams=streams_doc,
+                        prompt_texts=prompt_texts,
+                        prompt_shas=prompt_shas,
+                        large_prompts=large_prompts,
                     )
-
-            for stream in self._streams.values():
-                stream.branch = branches[stream.name]
-                stream.worktree = worktrees[stream.name]
-
-            self.terminal_names = {
-                kernel.qualified_name: terminal_name(
-                    self._stream_slugs[kernel.stream.name],
-                    slugify(kernel.name, fallback="kernel"),
-                    run_id,
-                    kernel.stream.name,
-                    kernel.name,
-                )
-                for kernel in self._kernels.values()
-            }
-
-            streams_doc = {
-                stream.name: {
-                    "name": stream.name,
-                    "base": stream.base,
-                    "base_commit": base_commits[stream.name],
-                    "branch": branches[stream.name],
-                    "worktree": str(worktrees[stream.name]),
-                    "space_id": self.space_id,
-                    "tab_id": self.tab_ids[stream.name],
-                }
-                for stream in self._streams.values()
-            }
-
-            execution = Execution(
-                graph=self,
-                run_id=run_id,
-                store=store,
-                lock=lock,
-                backend=backend,
-                streams=streams_doc,
-                prompt_texts=prompt_texts,
-                prompt_shas=prompt_shas,
-                large_prompts=large_prompts,
-            )
-            self._start_app_sync()
-            execution.start()
-            return execution
-        except BaseException:
-            self._rollback(created)
-            lock.release()
-            raise
+                    self._start_app_sync()
+                    execution.start()
+                    started_ok = True
+                    return execution
+                except BaseException:
+                    self._rollback(created)
+                    lock.release()
+                    raise
+            finally:
+                if not started_ok:
+                    self._start_attempted = False
 
     def run(self) -> Execution:
         execution = self.start()
@@ -400,12 +441,14 @@ class Graph:
         run_id: str,
         *,
         worktrees: bool = False,
+        branches: bool = False,
         force: bool = False,
     ) -> None:
         cleanup_run(
             self.repo,
             run_id,
             worktrees=worktrees,
+            branches=branches,
             force=force,
             backend=self._backend,
         )
